@@ -1,0 +1,28 @@
+[package]
+name = "aitch"
+version = "0.1.0"
+edition = "2021"
+description = "Universal AI account switcher — auto-activate the right AI accounts per directory"
+license = "MIT"
+repository = "https://github.com/orzazade/aitch"
+keywords = ["cli", "ai", "claude", "codex", "account-switcher"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+dirs = "6"
+colored = "3"
+thiserror = "2"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[[bin]]
+name = "aitch"
+path = "src/main.rs"
