@@ -46,14 +46,21 @@ pub fn generate_cache(config: &Config) -> String {
     out.push_str("    _d=$(dirname \"$_d\")\n");
     out.push_str("  done\n\n");
 
-    // Priority 2: Directory prefix match
+    // Priority 2: Directory prefix match (case-insensitive for macOS)
     out.push_str("  # Priority 2: Directory prefix match\n");
-    out.push_str("  case \"$PWD\" in\n");
+    out.push_str("  local _pwd_lower\n");
+    out.push_str("  _pwd_lower=$(printf '%s' \"$PWD\" | tr '[:upper:]' '[:lower:]')\n");
+    out.push_str("  case \"$_pwd_lower\" in\n");
     for (name, profile) in &config.profiles {
         let patterns: Vec<String> = profile
             .directories
             .iter()
-            .map(|d| format!("'{}'*", shell_escape(&expand_tilde(d))))
+            .map(|d| {
+                format!(
+                    "'{}'*",
+                    shell_escape(&expand_tilde(d).to_lowercase())
+                )
+            })
             .collect();
         if !patterns.is_empty() {
             out.push_str(&format!(
@@ -223,6 +230,9 @@ mod tests {
         assert!(cache.contains("_aitch_resolve"));
         assert!(cache.contains("CLAUDE_CONFIG_DIR"));
         assert!(cache.contains("/tmp/projects/appxite"));
+        // Verify case-insensitive matching: PWD is lowered before case match
+        assert!(cache.contains("_pwd_lower"));
+        assert!(cache.contains("tr '[:upper:]' '[:lower:]'"));
     }
 
     #[test]

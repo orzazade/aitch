@@ -41,11 +41,12 @@ pub fn resolve(pwd: &str, config: &Config) -> ResolveResult {
         // .aitch file references unknown profile, continue to next priority
     }
 
-    // Priority 2: Directory prefix match
+    // Priority 2: Directory prefix match (case-insensitive for macOS)
+    let pwd_lower = pwd.to_lowercase();
     for (name, profile) in &config.profiles {
         for dir in &profile.directories {
             let expanded = expand_tilde(dir);
-            if pwd.starts_with(&expanded) {
+            if pwd_lower.starts_with(&expanded.to_lowercase()) {
                 return ResolveResult {
                     profile_name: Some(name.clone()),
                     profile: Some(profile.clone()),
@@ -208,6 +209,14 @@ mod tests {
     fn resolve_directory_match() {
         let config = test_config();
         let result = resolve("/tmp/projects/appxite/subdir", &config);
+        assert_eq!(result.profile_name, Some("work".to_string()));
+        assert!(matches!(result.rule, MatchRule::DirectoryMatch { .. }));
+    }
+
+    #[test]
+    fn resolve_directory_match_case_insensitive() {
+        let config = test_config();
+        let result = resolve("/tmp/projects/Appxite/subdir", &config);
         assert_eq!(result.profile_name, Some("work".to_string()));
         assert!(matches!(result.rule, MatchRule::DirectoryMatch { .. }));
     }
