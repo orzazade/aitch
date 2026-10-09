@@ -56,10 +56,9 @@ pub fn generate_cache(config: &Config) -> String {
             .directories
             .iter()
             .map(|d| {
-                format!(
-                    "'{}'*",
-                    shell_escape(&expand_tilde(d).to_lowercase())
-                )
+                // The folder itself or anything inside it, never a sibling sharing the prefix.
+                let dir = shell_escape(&expand_tilde(d).trim_end_matches('/').to_lowercase());
+                format!("'{dir}'|'{dir}'/*")
             })
             .collect();
         if !patterns.is_empty() {
@@ -122,6 +121,11 @@ fn env_exports(profile: &crate::config::Profile) -> String {
     let mut out = String::new();
     for (key, value) in &profile.providers {
         if let Some(env_var) = providers::get_env_var(key) {
+            // An empty value means "use the tool's default folder": remove any inherited value.
+            if value.trim().is_empty() {
+                out.push_str(&format!("          unset {}\n", env_var));
+                continue;
+            }
             let expanded = expand_tilde(value);
             out.push_str(&format!(
                 "          export {}='{}'\n",
@@ -233,6 +237,58 @@ mod tests {
         // Verify case-insensitive matching: PWD is lowered before case match
         assert!(cache.contains("_pwd_lower"));
         assert!(cache.contains("tr '[:upper:]' '[:lower:]'"));
+    }
+
+    /// Source the generated cache in bash from `dir` with CLAUDE_CONFIG_DIR preset to "PRESET";
+    /// return what the variable ends up as ("UNSET" when unset).
+    fn run_cache(cache: &str, dir: &std::path::Path) -> String {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), cache).unwrap();
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "cd '{}' && export CLAUDE_CONFIG_DIR=PRESET && source '{}' && printf '%s' \"${{CLAUDE_CONFIG_DIR-UNSET}}\"",
+                dir.display(),
+                tmp.path().display()
+            ))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    fn boundary_config(root: &std::path::Path, personal_claude: &str) -> Config {
+        let mut profiles = BTreeMap::new();
+        let mut work = Profile::default();
+        work.providers.insert("claude".to_string(), "/tmp/claude-work".to_string());
+        work.directories.push(root.join("appxite").to_string_lossy().to_string());
+        let mut personal = Profile::default();
+        personal.providers.insert("claude".to_string(), personal_claude.to_string());
+        profiles.insert("work".to_string(), work);
+        profiles.insert("personal".to_string(), personal);
+        Config { default: Some("personal".to_string()), profiles }
+    }
+
+    #[test]
+    fn cache_directory_match_stops_at_a_folder_boundary() {
+        let root = tempfile::TempDir::new().unwrap();
+        for d in ["appxite/svc", "appxite-ideas"] {
+            std::fs::create_dir_all(root.path().join(d)).unwrap();
+        }
+        let cache = generate_cache(&boundary_config(root.path(), "/tmp/claude-personal"));
+        assert_eq!(run_cache(&cache, &root.path().join("appxite")), "/tmp/claude-work");
+        assert_eq!(run_cache(&cache, &root.path().join("appxite/svc")), "/tmp/claude-work");
+        assert_eq!(run_cache(&cache, &root.path().join("appxite-ideas")), "/tmp/claude-personal");
+    }
+
+    #[test]
+    fn empty_provider_value_unsets_the_variable() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join("elsewhere")).unwrap();
+        let cache = generate_cache(&boundary_config(root.path(), ""));
+        // Default profile with an empty claude provider: the inherited value is removed, so
+        // Claude Code falls back to its default folder (~/.claude).
+        assert_eq!(run_cache(&cache, &root.path().join("elsewhere")), "UNSET");
     }
 
     #[test]

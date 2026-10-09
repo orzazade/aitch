@@ -45,8 +45,10 @@ pub fn resolve(pwd: &str, config: &Config) -> ResolveResult {
     let pwd_lower = pwd.to_lowercase();
     for (name, profile) in &config.profiles {
         for dir in &profile.directories {
-            let expanded = expand_tilde(dir);
-            if pwd_lower.starts_with(&expanded.to_lowercase()) {
+            // The folder itself or anything inside it; a sibling that only shares the
+            // prefix (appxite-ideas for appxite) is not a match.
+            let dir_lower = expand_tilde(dir).trim_end_matches('/').to_lowercase();
+            if pwd_lower == dir_lower || pwd_lower.starts_with(&format!("{}/", dir_lower)) {
                 return ResolveResult {
                     profile_name: Some(name.clone()),
                     profile: Some(profile.clone()),
@@ -299,6 +301,18 @@ mod tests {
         assert!(result.is_some());
         let (_, profile) = result.unwrap();
         assert_eq!(profile, "work");
+    }
+
+    #[test]
+    fn directory_match_stops_at_a_folder_boundary() {
+        let config = test_config();
+        let work = |p: &str| resolve(p, &config).profile_name.as_deref() == Some("work");
+        assert!(work("/tmp/projects/appxite"));
+        assert!(work("/tmp/projects/appxite/svc-quote"));
+        assert!(work("/tmp/projects/APPXITE/svc-quote"));
+        // A sibling folder that only shares the prefix is not inside it.
+        assert!(!work("/tmp/projects/appxite-ideas"));
+        assert!(!work("/tmp/projects/appxitenotes/x"));
     }
 
     #[test]
