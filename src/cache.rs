@@ -80,7 +80,7 @@ pub fn generate_cache(config: &Config) -> String {
     out.push_str("  _remote=$(git remote get-url origin 2>/dev/null) || true\n");
     out.push_str("  if [ -n \"$_remote\" ]; then\n");
     out.push_str(&format!(
-        "    _remote=$(printf '%s' \"$_remote\" | sed -E '{NORMALIZE_REMOTE}')\n"
+        "    _remote=$(printf '%s' \"$_remote\" | sed -E '{NORMALIZE_REMOTE}') || true\n"
     ));
     out.push_str("    case \"$_remote\" in\n");
     for profile in config.profiles.values() {
@@ -88,7 +88,7 @@ pub fn generate_cache(config: &Config) -> String {
             .git_remotes
             .iter()
             .map(|r| {
-                let r = crate::resolve::normalize_remote(r);
+                let r = crate::resolve::normalize_pattern(r);
                 if let Some(prefix) = r.strip_suffix('*') {
                     format!("*'{}'*", shell_escape(prefix))
                 } else {
@@ -387,6 +387,7 @@ mod tests {
         for (name, dir, remote) in [
             ("work", Some("acme"), Some("github.com/acme/*")),
             ("corp", None, Some("git@github.com:corp/*")),
+            ("colon", None, Some("github.com:colon/*")),
             ("personal", None, None),
         ] {
             let mut pr = Profile::default();
@@ -436,6 +437,8 @@ mod tests {
             git("https", "https://github.com/acme/repo.git"),
             git("corp-ssh", "git@github.com:corp/x.git"),
             git("corp-https", "https://github.com/corp/x.git"),
+            git("colon-ssh", "git@github.com:colon/x.git"),
+            git("colon-https", "https://github.com/colon/x.git"),
             mk("elsewhere"),
         ];
         let cache = root.join("cache");

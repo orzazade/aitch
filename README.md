@@ -48,8 +48,8 @@ aitch uses a resolution chain to determine which profile to activate:
 
 1. `.aitch` file — drop a file containing a profile name in any repo
 2. **Directory match** — prefix match against configured directories
-3. **Git remote** — match against git remote URL patterns. Write patterns as `github.com/org/*`; they match HTTPS
-   and SSH (`git@github.com:org/repo`) clones alike
+3. **Git remote** — match against git remote URL patterns. A pattern such as `github.com/org/*` (or
+   `github.com:org/*`) matches HTTPS and SSH (`git@github.com:org/repo`) clones alike
 4. **Default profile** — fallback when nothing else matches
 
 A `.aitch` file that names a profile you don't have is skipped, and the walk goes on to the folders above it.

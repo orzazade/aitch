@@ -140,12 +140,20 @@ fn get_git_remote(pwd: &str) -> Option<String> {
 /// by normalizing "host:" to "host/" before matching.
 fn remote_matches(remote: &str, pattern: &str) -> bool {
     let normalized = normalize_remote(remote);
-    let normalized_pattern = normalize_remote(pattern);
+    let normalized_pattern = normalize_pattern(pattern);
     if let Some(prefix) = normalized_pattern.strip_suffix('*') {
         normalized.contains(prefix)
     } else {
         normalized.contains(&normalized_pattern)
     }
+}
+
+/// Normalize a remote pattern like a remote, and also the `host:org/*` form, which has no '@'.
+pub fn normalize_pattern(pattern: &str) -> String {
+    if !pattern.contains('@') && !pattern.contains("://") {
+        return pattern.replacen(':', "/", 1);
+    }
+    normalize_remote(pattern)
 }
 
 /// Normalize a git remote URL: replace "host:" with "host/" for SSH URLs.
@@ -321,5 +329,21 @@ mod tests {
         let expanded = expand_tilde("~/Projects/test");
         assert!(!expanded.starts_with("~/"));
         assert!(expanded.ends_with("/Projects/test"));
+    }
+
+    #[test]
+    fn colon_style_pattern_matches_ssh_and_https() {
+        assert!(remote_matches(
+            "git@github.com:org/x.git",
+            "github.com:org/*"
+        ));
+        assert!(remote_matches(
+            "https://github.com/org/x.git",
+            "github.com:org/*"
+        ));
+        assert!(!remote_matches(
+            "git@github.com:other/x.git",
+            "github.com:org/*"
+        ));
     }
 }

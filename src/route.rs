@@ -2,8 +2,10 @@
 //! says that account has room, and on the profile's own (fallback) dir otherwise. Unknown is never room.
 use crate::config::Route;
 use crate::resolve::expand_tilde;
+use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -197,8 +199,12 @@ pub fn link(from: &Path, to: &Path) -> Result<Vec<String>, String> {
     }
     // A link stores its target as written, and a relative one would resolve from inside `to`.
     let from = &std::path::absolute(from).map_err(|e| format!("{}: {e}", from.display()))?;
-    // The links would land in whatever folder it points to.
-    if fs::symlink_metadata(to).is_ok_and(|m| m.file_type().is_symlink()) {
+    // The links would land in whatever folder it points to. A trailing '/' makes the check follow the link.
+    let raw = to.as_os_str().as_bytes();
+    let end = raw.iter().rposition(|&b| b != b'/').map_or(1, |i| i + 1);
+    if fs::symlink_metadata(OsStr::from_bytes(&raw[..end]))
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
         return Err(format!(
             "{} is a symlink; give a real folder or a new path",
             to.display()
@@ -736,5 +742,20 @@ mod tests {
             "took",
         );
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn link_refuses_a_symlink_destination_written_with_a_slash() {
+        let s = setup();
+        let elsewhere = s.root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        symlink(&elsewhere, s.root.join("alt")).unwrap();
+        let err = link(&s.fallback, &s.root.join("alt/")).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(
+            fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "wrote through the link"
+        );
     }
 }

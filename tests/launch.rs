@@ -411,3 +411,39 @@ fn shells_starting_together_all_get_the_hook() {
         assert!(out.status.success(), "{}", text(&out.stderr));
     }
 }
+
+#[test]
+fn hook_survives_a_remote_sed_cannot_read_under_errexit() {
+    let e = Env::new(ROOM);
+    let repo = e.home.join("Projects/other/bad");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&std::ffi::OsStr]| {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success())
+    };
+    git(&["init".as_ref(), "-q".as_ref()]);
+    use std::os::unix::ffi::OsStrExt;
+    let url = std::ffi::OsStr::from_bytes(b"git@host:\xff\xfe/x");
+    git(&["remote".as_ref(), "add".as_ref(), "origin".as_ref(), url]);
+    assert!(e.run(&e.home, &["hook", "bash"]).status.success());
+    let run = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "set -e; source '{}'; echo reached",
+            e.home.join(".aitch/cache").display()
+        ))
+        .current_dir(&repo)
+        .env("PWD", &repo)
+        .env("LC_ALL", "en_US.UTF-8")
+        .output()
+        .unwrap();
+    assert!(
+        text(&run.stdout).contains("reached"),
+        "{}",
+        text(&run.stderr)
+    );
+}
