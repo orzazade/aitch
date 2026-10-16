@@ -225,10 +225,6 @@ fn hook_defines_claude_only_with_a_route() {
     for shell in ["zsh", "bash"] {
         let hook = text(&e.run(&e.home, &["hook", shell]).stdout);
         assert!(hook.contains("function claude {"), "{shell}: {hook}");
-        if Command::new(shell).arg("-c").arg("true").output().is_err() {
-            eprintln!("{shell} not installed: syntax check not run");
-            continue;
-        }
         let check = Command::new(shell)
             .arg("-n")
             .arg("-c")
@@ -367,10 +363,6 @@ fn which_uses_the_logical_directory_like_the_hook() {
 fn hook_survives_errexit_in_both_shells() {
     let e = Env::new(ROOM);
     for (shell, errexit) in [("bash", "set -e"), ("zsh", "setopt err_exit")] {
-        if Command::new(shell).arg("-c").arg("true").output().is_err() {
-            eprintln!("{shell} not installed: not run");
-            continue;
-        }
         let script = format!("{errexit}; eval \"$('{AITCH}' hook {shell})\"; echo reached");
         let run = Command::new(shell)
             .arg("-c")
