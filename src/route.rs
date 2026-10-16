@@ -295,7 +295,7 @@ pub fn project_key(cwd: &Path, home: &Path) -> String {
 }
 
 /// A linked worktree's `.git` file names `<repo>/.git/worktrees/<name>`, whose `commondir` leads to the repo's `.git`.
-/// Any other `.git` (a folder, or a submodule's file) keeps `dir`.
+/// Any other `.git` (a folder, a submodule's file, a worktree of a bare repo) keeps `dir`.
 fn main_worktree(dir: &Path) -> PathBuf {
     let common = fs::read_to_string(dir.join(".git"))
         .ok()
@@ -305,6 +305,7 @@ fn main_worktree(dir: &Path) -> PathBuf {
             fs::canonicalize(g.join(c.trim())).ok()
         });
     common
+        .filter(|c| c.file_name() == Some(OsStr::new(".git")))
         .and_then(|c| c.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| dir.to_path_buf())
 }
@@ -1161,6 +1162,14 @@ mod tests {
         fs::create_dir_all(s.root.join("super/.git/modules/m")).unwrap();
         fs::write(module.join(".git"), "gitdir: ../super/.git/modules/m\n").unwrap();
         assert_eq!(project_key(&module, &s.root), module.to_string_lossy());
+        // A worktree of a bare repo has no `.git` folder to stand under: it keeps its own folder.
+        let bare = s.root.join("bare/repo.git/worktrees/b");
+        fs::create_dir_all(&bare).unwrap();
+        fs::write(bare.join("commondir"), "../..\n").unwrap();
+        let bwt = s.root.join("bwt");
+        fs::create_dir_all(&bwt).unwrap();
+        fs::write(bwt.join(".git"), format!("gitdir: {}\n", bare.display())).unwrap();
+        assert_eq!(project_key(&bwt, &s.root), bwt.to_string_lossy());
     }
 
     #[test]
