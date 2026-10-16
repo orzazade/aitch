@@ -235,19 +235,30 @@ pub fn link(from: &Path, to: &Path) -> Result<Vec<String>, String> {
     Ok(made)
 }
 
-/// Write `{"mcpServers": …}` from `fallback_dir/.claude.json` to `out`, mode 0600, replacing it atomically.
-pub fn write_mcp(fallback_dir: &Path, out: &Path) -> Result<(), String> {
+/// Write `{"mcpServers": …}` from `fallback_dir/.claude.json` to `out`, mode 0600, replacing it atomically: the
+/// user-scope servers, then the local-scope ones of `folders` (the launch folder, as the shell and as the disk name
+/// it), which win on a shared name as they do in Claude Code.
+pub fn write_mcp(fallback_dir: &Path, folders: &[String], out: &Path) -> Result<(), String> {
     let json = claude_json(fallback_dir)?;
-    let servers = match &json["mcpServers"] {
-        serde_json::Value::Null => serde_json::json!({}),
-        v @ serde_json::Value::Object(_) => v.clone(),
-        _ => {
-            return Err(format!(
-                "mcpServers in {}/.claude.json is not an object",
-                fallback_dir.display()
-            ))
+    let mut servers = serde_json::Map::new();
+    let local = folders.iter().map(|f| {
+        (
+            format!("projects[{f}].mcpServers"),
+            &json["projects"][f.as_str()]["mcpServers"],
+        )
+    });
+    for (key, v) in std::iter::once(("mcpServers".to_string(), &json["mcpServers"])).chain(local) {
+        match v {
+            serde_json::Value::Null => {}
+            serde_json::Value::Object(m) => servers.extend(m.clone()),
+            _ => {
+                return Err(format!(
+                    "{key} in {}/.claude.json is not an object",
+                    fallback_dir.display()
+                ))
+            }
         }
-    };
+    }
     let body = serde_json::to_string(&serde_json::json!({ "mcpServers": servers }))
         .map_err(|e| e.to_string())?;
     let dir = out.parent().ok_or("MCP file has no folder")?;
@@ -270,11 +281,158 @@ pub fn write_mcp(fallback_dir: &Path, out: &Path) -> Result<(), String> {
     })
 }
 
+/// The folder Claude Code files a launch folder's local state under: the nearest folder above it (or itself) holding
+/// `.git`, unless that is the home folder; else the launch folder.
+pub fn project_key(cwd: &Path, home: &Path) -> String {
+    let root = cwd
+        .ancestors()
+        .find(|d| fs::symlink_metadata(d.join(".git")).is_ok())
+        .filter(|d| fs::canonicalize(d).ok() != fs::canonicalize(home).ok());
+    root.unwrap_or(cwd).to_string_lossy().to_string()
+}
+
+/// Mark as trusted in `to` every folder that `from` trusts and that is one of `folders` or a parent of one, so the
+/// launch does not ask "trust this folder?" again. Writes `to/.claude.json` only when that changes something, keeps
+/// its other fields and its mode. Returns the folders it marked.
+pub fn share_trust(from: &Path, to: &Path, folders: &[String]) -> Result<Vec<String>, String> {
+    if fs::symlink_metadata(from.join(".claude.json")).is_err() {
+        return Ok(vec![]);
+    }
+    let src = claude_json(from)?;
+    let Some(trusted) = src["projects"].as_object() else {
+        return Ok(vec![]);
+    };
+    let covers = |key: &str| {
+        let key = key.trim_end_matches('/');
+        !key.is_empty()
+            && folders
+                .iter()
+                .any(|f| f == key || f.starts_with(&format!("{key}/")))
+    };
+    let wanted: Vec<&String> = trusted
+        .iter()
+        .filter(|(k, v)| v["hasTrustDialogAccepted"] == true && covers(k))
+        .map(|(k, _)| k)
+        .collect();
+    let path = to.join(".claude.json");
+    let missing = |dst: &serde_json::Value| -> Vec<String> {
+        wanted
+            .iter()
+            .filter(|k| dst["projects"][k.as_str()]["hasTrustDialogAccepted"] != true)
+            .map(|k| k.to_string())
+            .collect()
+    };
+    if missing(&claude_json(to)?).is_empty() {
+        return Ok(vec![]);
+    }
+    // Claude Code changes this file under this lock, a folder; wait a little for it, never take it over.
+    let lock = to.join(".claude.json.lock");
+    let mut tries = 0;
+    while let Err(e) = fs::create_dir(&lock) {
+        tries += 1;
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(format!("cannot take {}: {e}", lock.display()));
+        }
+        if tries == 50 {
+            let age = fs::metadata(&lock)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .unwrap_or_default();
+            // Claude Code renews its lock while it holds it: an old one was left by a process that died.
+            return Err(if age > Duration::from_secs(60) {
+                format!(
+                    "{} is {} s old, maybe stale; remove it if no Claude Code is writing there",
+                    lock.display(),
+                    age.as_secs()
+                )
+            } else {
+                format!("{} is held by another process", lock.display())
+            });
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let result = write_trust(&path, &missing);
+    let _ = fs::remove_dir(&lock);
+    result
+}
+
+/// Inside the lock: read `path` again, mark what is still missing, and replace it only if nobody wrote it meanwhile.
+fn write_trust(
+    path: &Path,
+    missing: &dyn Fn(&serde_json::Value) -> Vec<String>,
+) -> Result<Vec<String>, String> {
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "{} is a symlink; not writing through it",
+            path.display()
+        ));
+    }
+    let dir = path.parent().ok_or("no folder")?;
+    let mut dst = claude_json(dir)?;
+    let todo = missing(&dst);
+    if todo.is_empty() {
+        return Ok(todo);
+    }
+    let bad = || format!("projects in {} is not an object", path.display());
+    let projects = dst
+        .as_object_mut()
+        .ok_or_else(bad)?
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(bad)?;
+    for k in &todo {
+        projects
+            .entry(k.clone())
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(bad)?
+            .insert("hasTrustDialogAccepted".into(), true.into());
+    }
+    let body = serde_json::to_string_pretty(&dst).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension(format!("json.aitch{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let write = || -> std::io::Result<bool> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.set_permissions(meta.permissions())?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+        // Another writer that skipped the lock: keep its version.
+        let now = fs::metadata(path)?;
+        if now.modified()? != meta.modified()? || now.len() != meta.len() {
+            return Ok(false);
+        }
+        fs::rename(&tmp, path)?;
+        Ok(true)
+    };
+    match write() {
+        Ok(true) => Ok(todo),
+        Ok(false) => {
+            let _ = fs::remove_file(&tmp);
+            Err(format!(
+                "{} changed while writing; trust not shared",
+                path.display()
+            ))
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(format!("cannot write {}: {e}", path.display()))
+        }
+    }
+}
+
 /// Pick the folder for one launch. Guards first (logins, links, MCP), then the quota verdict.
 pub fn decide(
     route: &Route,
     fallback_dir: &Path,
     primary_dir: &Path,
+    folders: &[String],
     mcp_out: &Path,
     verdict: impl FnOnce() -> Verdict,
 ) -> Decision {
@@ -302,7 +460,7 @@ pub fn decide(
         return fallback(format!("NOT USING THE PRIMARY DIR: {e}"), true);
     }
     match verdict() {
-        Verdict::Room(reason) => match write_mcp(fallback_dir, mcp_out) {
+        Verdict::Room(reason) => match write_mcp(fallback_dir, folders, mcp_out) {
             Ok(()) => Decision::Go(Choice {
                 dir: primary_dir.to_path_buf(),
                 primary: true,
@@ -320,7 +478,7 @@ pub fn decide(
 }
 
 /// The folder's login must belong to organization `want`.
-fn login_is(dir: &Path, want: &str) -> Result<(), String> {
+pub fn login_is(dir: &Path, want: &str) -> Result<(), String> {
     let org = org_of(dir)?;
     if org == want {
         Ok(())
@@ -390,7 +548,7 @@ mod tests {
     }
 
     fn go(s: &Setup, v: Verdict) -> Choice {
-        match decide(&s.route, &s.fallback, &s.primary, &s.mcp, || v) {
+        match decide(&s.route, &s.fallback, &s.primary, &[], &s.mcp, || v) {
             Decision::Go(c) => c,
             Decision::Refuse(r) => panic!("refused: {r}"),
         }
@@ -446,7 +604,7 @@ mod tests {
         let s = setup();
         login(&s.fallback, PRIMARY_ORG);
         let mut asked = false;
-        let d = decide(&s.route, &s.fallback, &s.primary, &s.mcp, || {
+        let d = decide(&s.route, &s.fallback, &s.primary, &[], &s.mcp, || {
             asked = true;
             Verdict::Room(String::new())
         });
@@ -461,7 +619,7 @@ mod tests {
     fn fallback_dir_without_login_refuses() {
         let s = setup();
         fs::remove_file(s.fallback.join(".claude.json")).unwrap();
-        let d = decide(&s.route, &s.fallback, &s.primary, &s.mcp, || {
+        let d = decide(&s.route, &s.fallback, &s.primary, &[], &s.mcp, || {
             Verdict::Room(String::new())
         });
         assert!(matches!(d, Decision::Refuse(_)), "{d:?}");
@@ -757,5 +915,200 @@ mod tests {
             0,
             "wrote through the link"
         );
+    }
+
+    fn write_json(path: &Path, v: serde_json::Value) {
+        fs::write(path, serde_json::to_string(&v).unwrap()).unwrap();
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn mcp_file_adds_the_folders_local_servers() {
+        let s = setup();
+        write_json(
+            &s.fallback.join(".claude.json"),
+            serde_json::json!({
+                "mcpServers": {"github": {"command": "user"}, "ado": {"command": "ado"}},
+                "projects": {
+                    "/r/svc": {"mcpServers": {"github": {"command": "local"}, "db": {"command": "db"}}},
+                    "/r/other": {"mcpServers": {"x": {"command": "x"}}}
+                }
+            }),
+        );
+        write_mcp(&s.fallback, &["/r/svc".to_string()], &s.mcp).unwrap();
+        let v = &read_json(&s.mcp)["mcpServers"];
+        assert_eq!(v["github"]["command"], "local", "local scope wins: {v}");
+        assert_eq!(v["db"]["command"], "db");
+        assert_eq!(v["ado"]["command"], "ado");
+        assert!(v.get("x").is_none(), "another folder's server: {v}");
+    }
+
+    #[test]
+    fn trust_follows_the_folder_and_its_parents() {
+        let s = setup();
+        let from = s.fallback.join(".claude.json");
+        let to = s.primary.join(".claude.json");
+        let mut f = read_json(&from);
+        f["projects"] = serde_json::json!({
+            "/r/svc": {"hasTrustDialogAccepted": true},
+            "/r": {"hasTrustDialogAccepted": true},
+            "/r/svc-ideas": {"hasTrustDialogAccepted": true},
+            "/q": {"hasTrustDialogAccepted": true},
+            "/r/svc/deep": {"hasTrustDialogAccepted": false}
+        });
+        write_json(&from, f);
+        let mut t = read_json(&to);
+        t["projects"] = serde_json::json!({"/r/svc": {"allowedTools": ["Read"]}});
+        write_json(&to, t);
+        fs::set_permissions(&to, fs::Permissions::from_mode(0o666)).unwrap();
+
+        let mut got = share_trust(&s.fallback, &s.primary, &["/r/svc/deep".to_string()]).unwrap();
+        got.sort();
+        assert_eq!(got, ["/r", "/r/svc"]);
+        let t = read_json(&to);
+        assert_eq!(t["projects"]["/r/svc"]["hasTrustDialogAccepted"], true);
+        assert_eq!(
+            t["projects"]["/r/svc"]["allowedTools"][0], "Read",
+            "other fields kept"
+        );
+        assert_eq!(t["projects"]["/r"]["hasTrustDialogAccepted"], true);
+        assert!(
+            t["projects"].get("/r/svc-ideas").is_none(),
+            "a sibling is not a parent"
+        );
+        assert!(t["projects"].get("/q").is_none());
+        assert_eq!(
+            t["oauthAccount"]["organizationUuid"], PRIMARY_ORG,
+            "login kept"
+        );
+        assert_eq!(
+            fs::metadata(&to).unwrap().permissions().mode() & 0o777,
+            0o666
+        );
+
+        let before = fs::read_to_string(&to).unwrap();
+        assert!(
+            share_trust(&s.fallback, &s.primary, &["/r/svc/deep".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read_to_string(&to).unwrap(),
+            before,
+            "no change, no write"
+        );
+    }
+
+    #[test]
+    fn trust_never_writes_through_a_symlinked_claude_json() {
+        let s = setup();
+        let from = s.fallback.join(".claude.json");
+        let mut f = read_json(&from);
+        f["projects"] = serde_json::json!({"/r": {"hasTrustDialogAccepted": true}});
+        write_json(&from, f);
+        let real = s.root.join("real.json");
+        fs::rename(s.primary.join(".claude.json"), &real).unwrap();
+        symlink(&real, s.primary.join(".claude.json")).unwrap();
+        assert!(share_trust(&s.fallback, &s.primary, &["/r".to_string()]).is_err());
+        assert!(fs::symlink_metadata(s.primary.join(".claude.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn project_key_is_the_git_root_like_claude_code() {
+        let s = setup();
+        let repo = s.root.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join("a/b")).unwrap();
+        let plain = s.root.join("plain/dir");
+        fs::create_dir_all(&plain).unwrap();
+        let key = |p: &Path| project_key(p, &s.root.join("home"));
+        assert_eq!(key(&repo.join("a/b")), repo.to_string_lossy());
+        assert_eq!(key(&repo), repo.to_string_lossy());
+        assert_eq!(key(&plain), plain.to_string_lossy());
+        // A home folder that is a git repo (dotfiles) is not a project root.
+        let home = s.root.join("dot");
+        fs::create_dir_all(home.join(".git")).unwrap();
+        fs::create_dir_all(home.join("notes")).unwrap();
+        assert_eq!(
+            project_key(&home.join("notes"), &home),
+            home.join("notes").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn trust_waits_for_a_held_lock_and_gives_up_without_writing() {
+        let s = setup();
+        let from = s.fallback.join(".claude.json");
+        let mut f = read_json(&from);
+        f["projects"] = serde_json::json!({"/r": {"hasTrustDialogAccepted": true}});
+        write_json(&from, f);
+        let lock = s.primary.join(".claude.json.lock");
+        fs::create_dir(&lock).unwrap();
+        let before = fs::read_to_string(s.primary.join(".claude.json")).unwrap();
+        let err = share_trust(&s.fallback, &s.primary, &["/r".to_string()]).unwrap_err();
+        assert!(err.contains("lock"), "{err}");
+        assert_eq!(
+            fs::read_to_string(s.primary.join(".claude.json")).unwrap(),
+            before
+        );
+        assert!(lock.is_dir(), "someone else's lock was removed");
+    }
+
+    #[test]
+    fn trust_from_a_dir_without_a_login_file_shares_nothing() {
+        let s = setup();
+        fs::remove_file(s.fallback.join(".claude.json")).unwrap();
+        assert!(share_trust(&s.fallback, &s.primary, &["/r".to_string()])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn project_key_sees_a_symlinked_home() {
+        let s = setup();
+        let dot = s.root.join("dot");
+        fs::create_dir_all(dot.join(".git")).unwrap();
+        fs::create_dir_all(dot.join("notes")).unwrap();
+        let home = s.root.join("home-link");
+        symlink(&dot, &home).unwrap();
+        let notes = dot.join("notes");
+        assert_eq!(project_key(&notes, &home), notes.to_string_lossy());
+    }
+
+    #[test]
+    fn an_old_lock_is_named_as_maybe_stale() {
+        let s = setup();
+        let from = s.fallback.join(".claude.json");
+        let mut f = read_json(&from);
+        f["projects"] = serde_json::json!({"/r": {"hasTrustDialogAccepted": true}});
+        write_json(&from, f);
+        let lock = s.primary.join(".claude.json.lock");
+        fs::create_dir(&lock).unwrap();
+        assert!(Command::new("touch")
+            .args(["-t", "202001010000"])
+            .arg(&lock)
+            .status()
+            .unwrap()
+            .success());
+        let err = share_trust(&s.fallback, &s.primary, &["/r".to_string()]).unwrap_err();
+        assert!(err.contains("stale") && err.contains("remove"), "{err}");
+        assert!(lock.is_dir());
+    }
+
+    #[test]
+    fn a_bad_local_mcp_entry_is_named() {
+        let s = setup();
+        write_json(
+            &s.fallback.join(".claude.json"),
+            serde_json::json!({"projects": {"/r": {"mcpServers": ["x"]}}}),
+        );
+        let err = write_mcp(&s.fallback, &["/r".to_string()], &s.mcp).unwrap_err();
+        assert!(err.contains("projects") && err.contains("/r"), "{err}");
     }
 }

@@ -321,16 +321,46 @@ pub fn launch(provider: &str, args: &[String]) -> Result<(), Box<dyn std::error:
         let mcp = config::config_dir()
             .join("run")
             .join(format!("{}-mcp.json", name));
-        let choice = match route::decide(
-            r,
-            Path::new(&fallback_dir),
-            Path::new(&primary_dir),
-            &mcp,
-            || route::read_verdict(&r.quota, route::QUOTA_TIMEOUT),
-        ) {
-            route::Decision::Go(c) => c,
-            route::Decision::Refuse(why) => {
-                return Err(format!("not launching claude: {}", why).into())
+        // The launch folder as the shell names it and as the disk does: Claude Code keys its per-folder state by one.
+        let mut folders = vec![pwd.clone()];
+        if let Ok(p) = env::current_dir() {
+            let p = p.to_string_lossy().to_string();
+            if p != pwd {
+                folders.push(p);
+            }
+        }
+        // Local-scope MCP servers are filed under the git root, as Claude Code does.
+        let home = dirs::home_dir().unwrap_or_default();
+        let project = env::current_dir()
+            .map(|d| route::project_key(&d, &home))
+            .unwrap_or_else(|_| pwd.clone());
+        let choice = if args.first().is_some_and(|a| a == "mcp") {
+            // `claude mcp` edits the servers; primary launches read them from the fallback dir.
+            if let Some(want) = &r.fallback_org {
+                route::login_is(Path::new(&fallback_dir), want)
+                    .map_err(|e| format!("not launching claude: {}", e))?;
+            }
+            route::Choice {
+                dir: fallback_dir.clone().into(),
+                primary: false,
+                reason:
+                    "claude mcp edits the fallback dir's servers, which primary launches use too"
+                        .into(),
+                loud: false,
+            }
+        } else {
+            match route::decide(
+                r,
+                Path::new(&fallback_dir),
+                Path::new(&primary_dir),
+                std::slice::from_ref(&project),
+                &mcp,
+                || route::read_verdict(&r.quota, route::QUOTA_TIMEOUT),
+            ) {
+                route::Decision::Go(c) => c,
+                route::Decision::Refuse(why) => {
+                    return Err(format!("not launching claude: {}", why).into())
+                }
             }
         };
         let (which, shown) = if choice.primary {
@@ -344,6 +374,27 @@ pub fn launch(provider: &str, args: &[String]) -> Result<(), Box<dyn std::error:
             choice.reason.clone()
         };
         eprintln!("aitch: {} → {} ({}): {}", name, which, shown, reason);
+        let other = if choice.primary {
+            &fallback_dir
+        } else {
+            &primary_dir
+        };
+        match route::share_trust(Path::new(other), &choice.dir, &folders) {
+            Ok(marked) => {
+                for f in marked {
+                    eprintln!(
+                        "aitch: {} is trusted in {} too, as in {}",
+                        f,
+                        choice.dir.display(),
+                        other
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "{}",
+                format!("aitch: folder trust not shared: {}", e).yellow()
+            ),
+        }
         cmd.env("CLAUDE_CONFIG_DIR", &choice.dir);
         if choice.primary {
             // One word: --mcp-config takes values up to the next flag and would eat the user's first arguments.

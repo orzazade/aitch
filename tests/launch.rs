@@ -439,3 +439,81 @@ fn hook_survives_a_remote_sed_cannot_read_under_errexit() {
         text(&run.stderr)
     );
 }
+
+#[test]
+fn mcp_subcommand_runs_on_the_fallback_dir_without_the_quota_command() {
+    let e = Env::new(&format!("touch \"$HOME/asked\"\n{ROOM}"));
+    let out = e.run(
+        &e.acme,
+        &["launch", "claude", "--", "mcp", "add", "db", "--", "db-mcp"],
+    );
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert!(so.contains(&format!("DIR={}\n", e.work_s())), "{so}");
+    assert!(!so.contains("--mcp-config"), "{so}");
+    assert!(
+        so.contains("ARG=mcp\nARG=add\nARG=db\nARG=--\nARG=db-mcp\n"),
+        "{so}"
+    );
+    assert!(!e.home.join("asked").exists(), "quota command ran");
+    assert!(se.contains("→ fallback"), "{se}");
+}
+
+#[test]
+fn a_primary_launch_trusts_a_folder_the_fallback_dir_trusts() {
+    let e = Env::new(ROOM);
+    let json = |d: &Path| -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(d.join(".claude.json")).unwrap()).unwrap()
+    };
+    let mut f = json(&e.work);
+    f["projects"] =
+        serde_json::json!({ e.acme.to_string_lossy(): {"hasTrustDialogAccepted": true} });
+    fs::write(e.work.join(".claude.json"), f.to_string()).unwrap();
+    let out = e.run(&e.acme, &["launch", "claude"]);
+    assert!(text(&out.stdout).contains(&format!("DIR={}\n", e.primary_s())));
+    let p = json(&e.primary);
+    assert_eq!(
+        p["projects"][e.acme.to_string_lossy().as_ref()]["hasTrustDialogAccepted"],
+        true,
+        "{p}"
+    );
+}
+
+#[test]
+fn primary_launch_in_a_repo_subfolder_gets_the_repo_local_servers() {
+    let e = Env::new(ROOM);
+    fs::create_dir_all(e.acme.join(".git")).unwrap();
+    let sub = e.acme.join("src/deep");
+    fs::create_dir_all(&sub).unwrap();
+    let mut f: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(e.work.join(".claude.json")).unwrap()).unwrap();
+    f["projects"] = serde_json::json!({
+        e.acme.to_string_lossy(): {"mcpServers": {"db": {"command": "db"}}},
+        sub.to_string_lossy(): {"mcpServers": {"old": {"command": "old"}}}
+    });
+    fs::write(e.work.join(".claude.json"), f.to_string()).unwrap();
+    let out = e.run(&sub, &["launch", "claude"]);
+    assert!(text(&out.stdout).contains(&format!("DIR={}\n", e.primary_s())));
+    let mcp: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(e.home.join(".aitch/run/work-mcp.json")).unwrap())
+            .unwrap();
+    let servers = &mcp["mcpServers"];
+    assert!(
+        servers.get("db").is_some() && servers.get("github").is_some(),
+        "{servers}"
+    );
+    assert!(servers.get("old").is_none(), "{servers}");
+}
+
+#[test]
+fn mcp_subcommand_still_checks_the_fallback_login() {
+    let e = Env::new(ROOM);
+    login(&e.work, "someone-else");
+    let out = e.run(&e.acme, &["launch", "claude", "--", "mcp", "list"]);
+    assert!(!out.status.success());
+    assert!(!text(&out.stdout).contains("DIR="), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains("not launching"),
+        "{}",
+        text(&out.stderr)
+    );
+}
