@@ -62,10 +62,7 @@ pub fn generate_cache(config: &Config) -> String {
             })
             .collect();
         if !patterns.is_empty() {
-            out.push_str(&format!(
-                "    {})\n",
-                patterns.join("|")
-            ));
+            out.push_str(&format!("    {})\n", patterns.join("|")));
             out.push_str(&env_exports(profile));
             out.push_str("      return 0\n");
             out.push_str("      ;;\n");
@@ -80,7 +77,7 @@ pub fn generate_cache(config: &Config) -> String {
     out.push_str("  _remote=$(git remote get-url origin 2>/dev/null) || true\n");
     out.push_str("  if [ -n \"$_remote\" ]; then\n");
     out.push_str("    case \"$_remote\" in\n");
-    for (_name, profile) in &config.profiles {
+    for profile in config.profiles.values() {
         let patterns: Vec<String> = profile
             .git_remotes
             .iter()
@@ -177,10 +174,7 @@ pub fn write_cache_to(config: &Config, path: &Path) -> Result<(), CacheError> {
     fs::write(&tmp_path, &content)?;
 
     // Validate shell syntax
-    let status = Command::new("sh")
-        .arg("-n")
-        .arg(&tmp_path)
-        .status();
+    let status = Command::new("sh").arg("-n").arg(&tmp_path).status();
 
     match status {
         Ok(s) if s.success() => {
@@ -253,20 +247,31 @@ mod tests {
             ))
             .output()
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).to_string()
     }
 
     fn boundary_config(root: &std::path::Path, personal_claude: &str) -> Config {
         let mut profiles = BTreeMap::new();
         let mut work = Profile::default();
-        work.providers.insert("claude".to_string(), "/tmp/claude-work".to_string());
-        work.directories.push(root.join("acme").to_string_lossy().to_string());
+        work.providers
+            .insert("claude".to_string(), "/tmp/claude-work".to_string());
+        work.directories
+            .push(root.join("acme").to_string_lossy().to_string());
         let mut personal = Profile::default();
-        personal.providers.insert("claude".to_string(), personal_claude.to_string());
+        personal
+            .providers
+            .insert("claude".to_string(), personal_claude.to_string());
         profiles.insert("work".to_string(), work);
         profiles.insert("personal".to_string(), personal);
-        Config { default: Some("personal".to_string()), profiles }
+        Config {
+            default: Some("personal".to_string()),
+            profiles,
+        }
     }
 
     #[test]
@@ -276,9 +281,18 @@ mod tests {
             std::fs::create_dir_all(root.path().join(d)).unwrap();
         }
         let cache = generate_cache(&boundary_config(root.path(), "/tmp/claude-personal"));
-        assert_eq!(run_cache(&cache, &root.path().join("acme")), "/tmp/claude-work");
-        assert_eq!(run_cache(&cache, &root.path().join("acme/svc")), "/tmp/claude-work");
-        assert_eq!(run_cache(&cache, &root.path().join("acme-ideas")), "/tmp/claude-personal");
+        assert_eq!(
+            run_cache(&cache, &root.path().join("acme")),
+            "/tmp/claude-work"
+        );
+        assert_eq!(
+            run_cache(&cache, &root.path().join("acme/svc")),
+            "/tmp/claude-work"
+        );
+        assert_eq!(
+            run_cache(&cache, &root.path().join("acme-ideas")),
+            "/tmp/claude-personal"
+        );
     }
 
     #[test]
@@ -341,8 +355,7 @@ mod tests {
         // Even if validation was bypassed, quoting prevents execution
         evil.providers
             .insert("claude".to_string(), "/tmp/safe-path".to_string());
-        evil.directories
-            .push("/tmp/normal/path".to_string());
+        evil.directories.push("/tmp/normal/path".to_string());
         config.profiles.insert("evil".to_string(), evil);
 
         let cache = generate_cache(&config);

@@ -72,7 +72,9 @@ pub fn add(
 
     if let Some(c) = claude {
         config::validate_path(c)?;
-        profile.providers.insert("claude".to_string(), c.to_string());
+        profile
+            .providers
+            .insert("claude".to_string(), c.to_string());
     }
 
     if let Some(c) = codex {

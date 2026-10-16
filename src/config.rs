@@ -94,7 +94,9 @@ pub fn validate_profile_name(name: &str) -> Result<(), ConfigError> {
 
 /// Validate a path for shell safety: reject shell metacharacters.
 pub fn validate_path(path: &str) -> Result<(), ConfigError> {
-    let forbidden = ['`', '$', '(', ')', ';', '&', '|', '>', '<', '\n', '\r', '\0'];
+    let forbidden = [
+        '`', '$', '(', ')', ';', '&', '|', '>', '<', '\n', '\r', '\0',
+    ];
     if path.chars().any(|c| forbidden.contains(&c)) {
         return Err(ConfigError::UnsafePath(path.to_string()));
     }
@@ -170,7 +172,7 @@ pub fn add_profile(config: &mut Config, name: &str, profile: Profile) -> Result<
     for dir in &profile.directories {
         validate_path(dir)?;
     }
-    for (_, provider_path) in &profile.providers {
+    for provider_path in profile.providers.values() {
         validate_path(provider_path)?;
     }
     config.profiles.insert(name.to_string(), profile);
@@ -242,19 +244,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.yaml");
 
-        let mut config = Config::default();
-        config.default = Some("personal".to_string());
+        let mut config = Config {
+            default: Some("personal".to_string()),
+            ..Default::default()
+        };
 
         let mut profile = Profile::default();
         profile
             .providers
             .insert("claude".to_string(), "~/.claude-work".to_string());
-        profile
-            .directories
-            .push("~/Projects/acme".to_string());
-        profile
-            .git_remotes
-            .push("github.com/acme/*".to_string());
+        profile.directories.push("~/Projects/acme".to_string());
+        profile.git_remotes.push("github.com/acme/*".to_string());
 
         add_profile(&mut config, "work", profile).unwrap();
         save_config_to(&config, &path).unwrap();
