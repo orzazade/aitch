@@ -8,6 +8,40 @@ use tempfile::TempDir;
 
 const AITCH: &str = env!("CARGO_BIN_EXE_aitch");
 
+/// Writing a script and starting a process never overlap: a child forked while another test thread has a script
+/// open for writing holds that file, and Linux then refuses to exec it ("Text file busy").
+static FORK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn fork_lock() -> std::sync::MutexGuard<'static, ()> {
+    FORK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+trait Locked {
+    fn locked_spawn(&mut self) -> std::io::Result<std::process::Child>;
+    fn locked_output(&mut self) -> std::io::Result<Output>;
+    fn locked_status(&mut self) -> std::io::Result<std::process::ExitStatus>;
+}
+
+impl Locked for Command {
+    fn locked_spawn(&mut self) -> std::io::Result<std::process::Child> {
+        let _g = fork_lock();
+        self.spawn()
+    }
+
+    fn locked_output(&mut self) -> std::io::Result<Output> {
+        use std::process::Stdio;
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .locked_spawn()?
+            .wait_with_output()
+    }
+
+    fn locked_status(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.locked_spawn()?.wait()
+    }
+}
+
 struct Env {
     _tmp: TempDir,
     home: PathBuf,
@@ -19,6 +53,7 @@ struct Env {
 }
 
 fn script(path: &Path, body: &str) {
+    let _g = fork_lock();
     fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
@@ -109,7 +144,7 @@ impl Env {
     }
 
     fn run(&self, cwd: &Path, args: &[&str]) -> Output {
-        self.cmd(cwd, args).output().unwrap()
+        self.cmd(cwd, args).locked_output().unwrap()
     }
 }
 
@@ -186,7 +221,7 @@ fn exit_code_of_claude_comes_back() {
     let out = e
         .cmd(&e.acme, &["launch", "claude"])
         .env("FAKE_EXIT", "7")
-        .output()
+        .locked_output()
         .unwrap();
     assert_eq!(out.status.code(), Some(7));
 }
@@ -229,7 +264,7 @@ fn hook_defines_claude_only_with_a_route() {
             .arg("-n")
             .arg("-c")
             .arg(&hook)
-            .output()
+            .locked_output()
             .unwrap();
         assert!(
             check.status.success(),
@@ -258,7 +293,7 @@ fn shell_function_routes_through_launch() {
             format!("{}:{}:/usr/bin:/bin", aitch_dir.display(), e.bin.display()),
         )
         .env("NO_COLOR", "1")
-        .output()
+        .locked_output()
         .unwrap();
     let so = text(&out.stdout);
     assert!(
@@ -298,7 +333,7 @@ fn launch_resolves_the_logical_directory_like_the_hook() {
     let out = e
         .cmd(&link, &["launch", "claude"])
         .env("PWD", &link)
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         text(&out.stdout).contains("DIR=/inherited\n"),
@@ -351,7 +386,11 @@ fn which_uses_the_logical_directory_like_the_hook() {
     let e = Env::new(ROOM);
     let link = e.home.join("Projects/personal/link");
     std::os::unix::fs::symlink(&e.acme, &link).unwrap();
-    let out = e.cmd(&link, &["which"]).env("PWD", &link).output().unwrap();
+    let out = e
+        .cmd(&link, &["which"])
+        .env("PWD", &link)
+        .locked_output()
+        .unwrap();
     assert!(
         text(&out.stdout).contains("personal"),
         "{}",
@@ -370,7 +409,7 @@ fn hook_survives_errexit_in_both_shells() {
             .current_dir(&e.acme)
             .env("HOME", &e.home)
             .env("PATH", format!("{}:/usr/bin:/bin", e.bin.display()))
-            .output()
+            .locked_output()
             .unwrap();
         assert!(
             text(&run.stdout).contains("reached"),
@@ -396,7 +435,7 @@ fn shells_starting_together_all_get_the_hook() {
     let e = Env::new(ROOM);
     let _ = fs::remove_file(e.home.join(".aitch/cache"));
     let kids: Vec<_> = (0..8)
-        .map(|_| e.cmd(&e.home, &["hook", "zsh"]).spawn().unwrap())
+        .map(|_| e.cmd(&e.home, &["hook", "zsh"]).locked_spawn().unwrap())
         .collect();
     for k in kids {
         let out = k.wait_with_output().unwrap();
@@ -413,7 +452,7 @@ fn hook_survives_a_remote_sed_cannot_read_under_errexit() {
         assert!(Command::new("git")
             .args(args)
             .current_dir(&repo)
-            .status()
+            .locked_status()
             .unwrap()
             .success())
     };
@@ -431,7 +470,7 @@ fn hook_survives_a_remote_sed_cannot_read_under_errexit() {
         .current_dir(&repo)
         .env("PWD", &repo)
         .env("LC_ALL", "en_US.UTF-8")
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         text(&run.stdout).contains("reached"),

@@ -563,7 +563,8 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        format!("{} quota --room", path.display())
+        // Run through sh, not exec'd: Linux refuses to exec a file that a forked test thread still holds open.
+        format!("/bin/sh {} quota --room", path.display())
     }
 
     // 1. room, guards pass → primary, the quota command's reason on the line.
@@ -816,7 +817,7 @@ mod tests {
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         unknown_containing(
-            read_verdict(&path.to_string_lossy(), QUOTA_TIMEOUT),
+            read_verdict(&format!("/bin/sh {}", path.display()), QUOTA_TIMEOUT),
             "db locked",
         );
     }
@@ -857,7 +858,7 @@ mod tests {
         fs::write(&path, "#!/bin/sh\necho 'store missing' >&2\nexit 4\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         unknown_containing(
-            read_verdict(&path.to_string_lossy(), QUOTA_TIMEOUT),
+            read_verdict(&format!("/bin/sh {}", path.display()), QUOTA_TIMEOUT),
             "store missing",
         );
     }
@@ -874,7 +875,10 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         let start = std::time::Instant::now();
         unknown_containing(
-            read_verdict(&path.to_string_lossy(), Duration::from_millis(300)),
+            read_verdict(
+                &format!("/bin/sh {}", path.display()),
+                Duration::from_millis(300),
+            ),
             "took",
         );
         assert!(start.elapsed() < Duration::from_secs(2));
@@ -896,7 +900,10 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         let start = std::time::Instant::now();
         unknown_containing(
-            read_verdict(&path.to_string_lossy(), Duration::from_millis(300)),
+            read_verdict(
+                &format!("/bin/sh {}", path.display()),
+                Duration::from_millis(300),
+            ),
             "took",
         );
         assert!(start.elapsed() < Duration::from_secs(2));
