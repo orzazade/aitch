@@ -282,7 +282,8 @@ pub fn hook(shell: &str) -> Result<(), Box<dyn std::error::Error>> {
         "bash" => print!("{}", hooks::bash::generate(routed)),
         _ => return Err(format!("unsupported shell: '{}' (use zsh or bash)", shell).into()),
     }
-    cfg?;
+    // A hand-edited config reaches the hook in every new shell, so the hook and `aitch launch` read the same rules.
+    cache::write_cache(&cfg?)?;
     Ok(())
 }
 

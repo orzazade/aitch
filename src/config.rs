@@ -127,6 +127,7 @@ fn check_routes(config: &Config) -> Result<(), ConfigError> {
         let Some(route) = profile.route.as_ref().and_then(|r| r.claude.as_ref()) else {
             continue;
         };
+        validate_profile_name(name)?;
         let bad = |why: &str| ConfigError::BadRoute(name.clone(), why.to_string());
         for (field, value) in [
             ("primary", Some(&route.primary)),
@@ -334,6 +335,13 @@ mod tests {
         assert!(load_config_from(&path).is_err(), "org given but empty");
         fs::write(&path, format!("{base}        quota: q\n        typo: 1\n")).unwrap();
         assert!(load_config_from(&path).is_err(), "unknown field");
+        // The name becomes part of a file path for the launch.
+        let named =
+            |n: &str| format!("{base}        quota: q\n").replace("  work:", &format!("  '{n}':"));
+        fs::write(&path, named("../../evil")).unwrap();
+        assert!(load_config_from(&path).is_err(), "path in the profile name");
+        fs::write(&path, named("work-2")).unwrap();
+        assert!(load_config_from(&path).is_ok(), "plain name");
     }
 
     #[test]

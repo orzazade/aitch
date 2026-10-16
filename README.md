@@ -48,10 +48,14 @@ aitch uses a resolution chain to determine which profile to activate:
 
 1. `.aitch` file — drop a file containing a profile name in any repo
 2. **Directory match** — prefix match against configured directories
-3. **Git remote** — match against git remote URL patterns
+3. **Git remote** — match against git remote URL patterns. Write patterns as `github.com/org/*`; they match HTTPS
+   and SSH (`git@github.com:org/repo`) clones alike
 4. **Default profile** — fallback when nothing else matches
 
-The shell hook runs on every `cd` and sources a pre-compiled cache file. Static matches resolve in <1ms. Git remote detection (~3-5ms) only runs for unmatched directories.
+A `.aitch` file that names a profile you don't have is skipped, and the walk goes on to the folders above it.
+
+The shell hook runs on every `cd` and sources a pre-compiled cache file. `aitch` commands rebuild it, and so does
+every new shell, so after editing `config.yaml` by hand, open a new shell. Static matches resolve in <1ms. Git remote detection (~3-5ms) only runs for unmatched directories.
 
 ## Commands
 
@@ -126,7 +130,8 @@ CLAUDE_CONFIG_DIR=~/.claude-alt command claude  # then /login with the second ac
 `skills`, `commands`, `hooks`, `output-styles`, `plugins` and `projects` (each one that exists). The login
 (`.claude.json` and the keychain entry) stays separate. It never replaces a file that is not the right link. MCP
 servers live next to the login, so on each launch in the primary dir aitch passes the fallback dir's `mcpServers`
-with `--mcp-config` (a file under `~/.aitch/run/`, mode 0600, rewritten on each launch), and sets
+with `--mcp-config` (a file under `~/.aitch/run/`, mode 0600, rewritten on each launch; it stays after the launch
+because aitch replaces itself with Claude Code, and it holds the same servers as the fallback dir's `.claude.json`), and sets
 `ENABLE_CLAUDEAI_MCP_SERVERS=false` so the second account's own claude.ai connectors stay out.
 
 With a route, the shell hook defines a `claude` function that calls `aitch launch claude`. It prints one line to

@@ -27,7 +27,9 @@ pub struct ResolveResult {
 /// 4. Default profile
 pub fn resolve(pwd: &str, config: &Config) -> ResolveResult {
     // Priority 1: .aitch file
-    if let Some((file_path, profile_name)) = find_aitch_file(pwd) {
+    if let Some((file_path, profile_name)) =
+        find_aitch_file(pwd, |p| config.profiles.contains_key(p))
+    {
         if let Some(profile) = config.profiles.get(&profile_name) {
             return ResolveResult {
                 profile_name: Some(profile_name.clone()),
@@ -38,7 +40,6 @@ pub fn resolve(pwd: &str, config: &Config) -> ResolveResult {
                 },
             };
         }
-        // .aitch file references unknown profile, continue to next priority
     }
 
     // Priority 2: Directory prefix match (case-insensitive for macOS)
@@ -97,16 +98,16 @@ pub fn resolve(pwd: &str, config: &Config) -> ResolveResult {
     }
 }
 
-/// Walk up from pwd looking for a .aitch file.
-/// Returns (file_path, profile_name) if found.
-pub fn find_aitch_file(pwd: &str) -> Option<(String, String)> {
+/// Walk up from pwd to the nearest `.aitch` that names a `known` profile, as the hook's cache finds it: whitespace is dropped, one naming
+/// an unknown profile is skipped, and `/` itself is not checked.
+pub fn find_aitch_file(pwd: &str, known: impl Fn(&str) -> bool) -> Option<(String, String)> {
     let mut dir = Path::new(pwd);
-    loop {
+    while dir != Path::new("/") {
         let aitch_file = dir.join(".aitch");
         if aitch_file.is_file() {
             if let Ok(contents) = std::fs::read_to_string(&aitch_file) {
-                let profile = contents.trim().to_string();
-                if !profile.is_empty() {
+                let profile: String = contents.split_whitespace().collect();
+                if known(&profile) {
                     return Some((aitch_file.to_string_lossy().to_string(), profile));
                 }
             }
@@ -148,7 +149,7 @@ fn remote_matches(remote: &str, pattern: &str) -> bool {
 }
 
 /// Normalize a git remote URL: replace "host:" with "host/" for SSH URLs.
-fn normalize_remote(url: &str) -> String {
+pub fn normalize_remote(url: &str) -> String {
     // git@github.com:org/repo.git -> git@github.com/org/repo.git
     if let Some(at_pos) = url.find('@') {
         if let Some(colon_pos) = url[at_pos..].find(':') {
@@ -297,7 +298,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(dir.path().join(".aitch"), "work").unwrap();
 
-        let result = find_aitch_file(sub.to_str().unwrap());
+        let result = find_aitch_file(sub.to_str().unwrap(), |p| p == "work");
         assert!(result.is_some());
         let (_, profile) = result.unwrap();
         assert_eq!(profile, "work");

@@ -105,7 +105,13 @@ pub fn read_verdict(cmd: &str, timeout: Duration) -> Verdict {
             .unwrap_or("no JSON on stdout");
         return Verdict::Unknown(format!("exit {code}: {why}"));
     };
-    let reason = json["reason"].as_str().unwrap_or("").to_string();
+    let mut reason = json["reason"].as_str().unwrap_or("").to_string();
+    // An exit code outside the contract is a failure of the command: its stderr says why.
+    if ![0, 3, 4].contains(&code) {
+        if let Some(line) = err.lines().find(|l| !l.trim().is_empty()) {
+            reason = format!("{reason} (stderr: {line})");
+        }
+    }
     match (code, json["verdict"].as_str()) {
         (0, Some("room")) => Verdict::Room(reason),
         (3, Some("full")) => Verdict::Full(reason),
@@ -191,6 +197,13 @@ pub fn link(from: &Path, to: &Path) -> Result<Vec<String>, String> {
     }
     // A link stores its target as written, and a relative one would resolve from inside `to`.
     let from = &std::path::absolute(from).map_err(|e| format!("{}: {e}", from.display()))?;
+    // The links would land in whatever folder it points to.
+    if fs::symlink_metadata(to).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!(
+            "{} is a symlink; give a real folder or a new path",
+            to.display()
+        ));
+    }
     fs::create_dir_all(to).map_err(|e| format!("cannot create {}: {e}", to.display()))?;
     let mut made = vec![];
     for name in LINKS {
@@ -570,6 +583,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn link_refuses_a_destination_that_is_a_symlink() {
+        let s = setup();
+        let elsewhere = s.root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let to = s.root.join("alt");
+        symlink(&elsewhere, &to).unwrap();
+        let err = link(&s.fallback, &to).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(
+            fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "wrote through the link"
+        );
+    }
+
     // 1-5 on the reader, with a fake quota command.
     #[test]
     fn reader_room_on_exit_0() {
@@ -610,6 +639,22 @@ mod tests {
         let t = TempDir::new().unwrap();
         let cmd = fake_quota(t.path(), r#"{"verdict":"room","reason":"x"}"#, 1);
         unknown_containing(read_verdict(&cmd, QUOTA_TIMEOUT), "exit 1");
+    }
+
+    #[test]
+    fn reader_unexpected_exit_shows_stderr_even_with_json() {
+        let t = TempDir::new().unwrap();
+        let path = t.path().join("quota");
+        fs::write(
+            &path,
+            "#!/bin/sh\necho '{\"verdict\":\"room\",\"reason\":\"x\"}'\necho 'db locked' >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        unknown_containing(
+            read_verdict(&path.to_string_lossy(), QUOTA_TIMEOUT),
+            "db locked",
+        );
     }
 
     #[test]

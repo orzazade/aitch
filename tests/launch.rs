@@ -362,3 +362,52 @@ fn which_uses_the_logical_directory_like_the_hook() {
         text(&out.stdout)
     );
 }
+
+#[test]
+fn hook_survives_errexit_in_both_shells() {
+    let e = Env::new(ROOM);
+    for (shell, errexit) in [("bash", "set -e"), ("zsh", "setopt err_exit")] {
+        if Command::new(shell).arg("-c").arg("true").output().is_err() {
+            eprintln!("{shell} not installed: not run");
+            continue;
+        }
+        let script = format!("{errexit}; eval \"$('{AITCH}' hook {shell})\"; echo reached");
+        let run = Command::new(shell)
+            .arg("-c")
+            .arg(&script)
+            .current_dir(&e.acme)
+            .env("HOME", &e.home)
+            .env("PATH", format!("{}:/usr/bin:/bin", e.bin.display()))
+            .output()
+            .unwrap();
+        assert!(
+            text(&run.stdout).contains("reached"),
+            "{shell}: {}",
+            text(&run.stderr)
+        );
+    }
+}
+
+#[test]
+fn hook_rebuilds_the_cache_from_a_hand_edited_config() {
+    let e = Env::new(ROOM);
+    let cache = e.home.join(".aitch/cache");
+    let _ = fs::remove_file(&cache);
+    let out = e.run(&e.home, &["hook", "zsh"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let body = fs::read_to_string(&cache).expect("hook wrote no cache");
+    assert!(body.contains(&e.work_s()), "{body}");
+}
+
+#[test]
+fn shells_starting_together_all_get_the_hook() {
+    let e = Env::new(ROOM);
+    let _ = fs::remove_file(e.home.join(".aitch/cache"));
+    let kids: Vec<_> = (0..8)
+        .map(|_| e.cmd(&e.home, &["hook", "zsh"]).spawn().unwrap())
+        .collect();
+    for k in kids {
+        let out = k.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+    }
+}

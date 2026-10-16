@@ -25,7 +25,7 @@ _aitch_hook
         cache_str,
         cache_str,
         if routed {
-            "\n# A route picks the Claude Code folder at launch\nunalias claude 2>/dev/null\nfunction claude { command aitch launch claude -- \"$@\"; }\n"
+            "\n# A route picks the Claude Code folder at launch\nunalias claude 2>/dev/null || true\nfunction claude { command aitch launch claude -- \"$@\"; }\n"
         } else {
             ""
         }

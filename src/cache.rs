@@ -14,6 +14,9 @@ pub enum CacheError {
     InvalidSyntax,
 }
 
+/// resolve::normalize_remote in sed: the first ':' after the first '@' becomes '/', unless a '/' comes right before it.
+const NORMALIZE_REMOTE: &str = "s#^([^@]*@([^:]*[^:/])?):#\\1/#";
+
 /// Generate the shell cache script from config.
 pub fn generate_cache(config: &Config) -> String {
     let mut out = String::new();
@@ -29,10 +32,10 @@ pub fn generate_cache(config: &Config) -> String {
 
     // Priority 1: .aitch file walk-up
     out.push_str("  # Priority 1: .aitch file\n");
-    out.push_str("  local _d=\"$PWD\"\n");
+    // Declared once: zsh prints a variable that `local` declares again.
+    out.push_str("  local _d=\"$PWD\" _p\n");
     out.push_str("  while [ \"$_d\" != '/' ]; do\n");
     out.push_str("    if [ -f \"$_d/.aitch\" ]; then\n");
-    out.push_str("      local _p\n");
     out.push_str("      _p=$(cat \"$_d/.aitch\" 2>/dev/null | tr -d '[:space:]')\n");
     out.push_str("      case \"$_p\" in\n");
     for (name, profile) in &config.profiles {
@@ -76,16 +79,20 @@ pub fn generate_cache(config: &Config) -> String {
     out.push_str("  local _remote\n");
     out.push_str("  _remote=$(git remote get-url origin 2>/dev/null) || true\n");
     out.push_str("  if [ -n \"$_remote\" ]; then\n");
+    out.push_str(&format!(
+        "    _remote=$(printf '%s' \"$_remote\" | sed -E '{NORMALIZE_REMOTE}')\n"
+    ));
     out.push_str("    case \"$_remote\" in\n");
     for profile in config.profiles.values() {
         let patterns: Vec<String> = profile
             .git_remotes
             .iter()
             .map(|r| {
+                let r = crate::resolve::normalize_remote(r);
                 if let Some(prefix) = r.strip_suffix('*') {
                     format!("*'{}'*", shell_escape(prefix))
                 } else {
-                    format!("*'{}'*", shell_escape(r))
+                    format!("*'{}'*", shell_escape(&r))
                 }
             })
             .collect();
@@ -165,7 +172,12 @@ pub fn write_cache(config: &Config) -> Result<(), CacheError> {
 
 pub fn write_cache_to(config: &Config, path: &Path) -> Result<(), CacheError> {
     let content = generate_cache(config);
-    let tmp_path = path.with_extension("tmp");
+    // Every shell start calls this: skip the syntax check and the write when nothing changed.
+    if fs::read_to_string(path).is_ok_and(|old| old == content) {
+        return Ok(());
+    }
+    // Shells that start together must not share one temp file.
+    let tmp_path = path.with_extension(format!("tmp{}", std::process::id()));
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -362,5 +374,124 @@ mod tests {
         // All paths should be single-quoted in output
         assert!(cache.contains("'/tmp/safe-path'"));
         assert!(cache.contains("'/tmp/normal/path'"));
+    }
+
+    /// The hook's shell resolver and `resolve()` are two copies of one rule set; `aitch launch` uses the second.
+    /// Every case must pick the same profile in both.
+    #[test]
+    fn hook_and_resolve_pick_the_same_profile() {
+        let t = TempDir::new().unwrap();
+        let root = t.path().canonicalize().unwrap();
+        let p = |s: &str| root.join(s).to_string_lossy().to_string();
+        let mut profiles = BTreeMap::new();
+        for (name, dir, remote) in [
+            ("work", Some("acme"), Some("github.com/acme/*")),
+            ("corp", None, Some("git@github.com:corp/*")),
+            ("personal", None, None),
+        ] {
+            let mut pr = Profile::default();
+            pr.providers.insert("claude".into(), format!("/cfg/{name}"));
+            pr.directories.extend(dir.map(p));
+            pr.git_remotes.extend(remote.map(String::from));
+            profiles.insert(name.to_string(), pr);
+        }
+        let config = Config {
+            default: Some("personal".into()),
+            profiles,
+        };
+        let mk = |d: &str| {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+            p(d)
+        };
+        let git = |d: &str, url: &str| {
+            let dir = mk(d);
+            for args in [vec!["init", "-q"], vec!["remote", "add", "origin", url]] {
+                assert!(std::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(&dir)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            dir
+        };
+        let aitch =
+            |d: &str, body: &str| std::fs::write(root.join(d).join(".aitch"), body).unwrap();
+        let cases = [
+            mk("acme/svc"),
+            mk("ACME/svc"),
+            mk("acme-ideas"),
+            {
+                mk("known/unknown/deep");
+                aitch("known", "corp\n");
+                aitch("known/unknown", "no-such-profile\n");
+                p("known/unknown/deep")
+            },
+            {
+                mk("acme/odd");
+                aitch("acme/odd", "nope");
+                p("acme/odd")
+            },
+            git("ssh", "git@github.com:acme/repo.git"),
+            git("https", "https://github.com/acme/repo.git"),
+            git("corp-ssh", "git@github.com:corp/x.git"),
+            git("corp-https", "https://github.com/corp/x.git"),
+            mk("elsewhere"),
+        ];
+        let cache = root.join("cache");
+        std::fs::write(&cache, generate_cache(&config)).unwrap();
+        let mut wrong = vec![];
+        for (shell, dir) in ["bash", "zsh"]
+            .iter()
+            .flat_map(|sh| cases.iter().map(move |d| (*sh, d)))
+        {
+            let out = std::process::Command::new(shell)
+                .arg("-fc")
+                .arg(format!(
+                    "unset CLAUDE_CONFIG_DIR; source '{}'; echo \"${{CLAUDE_CONFIG_DIR-}}\"",
+                    cache.display()
+                ))
+                .current_dir(dir)
+                .env("PWD", dir)
+                .output()
+                .unwrap();
+            let hook = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let r = crate::resolve::resolve(dir, &config);
+            let rust = r
+                .profile
+                .map(|p| p.providers["claude"].clone())
+                .unwrap_or_default();
+            if hook != rust {
+                wrong.push(format!("{shell} {dir}: hook {hook:?}, resolve {rust:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn shell_remote_normalizing_matches_resolve() {
+        let urls = [
+            "git@github.com:acme/repo.git",
+            "https://github.com/acme/repo.git",
+            "ssh://git@host:22/org/repo",
+            "https://user:pass@host/org",
+            "git@host:/abs/path",
+            "ssh://git@host/:x@y:z",
+            "a@b@c:d",
+            "@:x",
+            "git@/:x",
+            "no-at:all",
+        ];
+        for url in urls {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s' \"$1\" | sed -E '{NORMALIZE_REMOTE}'"))
+                .arg("sh")
+                .arg(url)
+                .output()
+                .unwrap();
+            let shell = String::from_utf8_lossy(&out.stdout).to_string();
+            assert_eq!(shell, crate::resolve::normalize_remote(url), "{url}");
+        }
     }
 }
