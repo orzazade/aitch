@@ -4,6 +4,7 @@ mod config;
 mod hooks;
 mod providers;
 mod resolve;
+mod route;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -72,6 +73,25 @@ enum Commands {
         /// Shell type: zsh or bash
         shell: String,
     },
+
+    /// Start a provider with the folder its route picks for this directory (the hook's `claude` calls this)
+    Launch {
+        /// Provider to start: claude
+        provider: String,
+
+        /// Arguments passed to the provider unchanged (after --)
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+
+    /// Make <to> a config folder with its own login and the rules of <from> by symlink
+    Link {
+        /// The folder whose rules are shared (e.g. ~/.claude-work)
+        from: String,
+
+        /// The folder to create (e.g. ~/.claude-alt)
+        to: String,
+    },
 }
 
 fn main() {
@@ -100,6 +120,8 @@ fn main() {
         Commands::Status => cli::status(),
         Commands::Which => cli::which(),
         Commands::Hook { shell } => cli::hook(&shell),
+        Commands::Launch { provider, args } => cli::launch(&provider, &args),
+        Commands::Link { from, to } => cli::link(&from, &to),
     };
 
     if let Err(e) = result {

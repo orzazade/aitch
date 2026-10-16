@@ -207,8 +207,8 @@ mod tests {
         let mut work = Profile::default();
         work.providers
             .insert("claude".to_string(), "/tmp/claude-work".to_string());
-        work.directories.push("/tmp/projects/appxite".to_string());
-        work.git_remotes.push("github.com/appxite/*".to_string());
+        work.directories.push("/tmp/projects/acme".to_string());
+        work.git_remotes.push("github.com/acme/*".to_string());
 
         let mut personal = Profile::default();
         personal
@@ -216,7 +216,7 @@ mod tests {
             .insert("claude".to_string(), "/tmp/claude-personal".to_string());
         personal
             .directories
-            .push("/tmp/projects/scifi".to_string());
+            .push("/tmp/projects/personal".to_string());
 
         profiles.insert("work".to_string(), work);
         profiles.insert("personal".to_string(), personal);
@@ -233,7 +233,7 @@ mod tests {
         let cache = generate_cache(&config);
         assert!(cache.contains("_aitch_resolve"));
         assert!(cache.contains("CLAUDE_CONFIG_DIR"));
-        assert!(cache.contains("/tmp/projects/appxite"));
+        assert!(cache.contains("/tmp/projects/acme"));
         // Verify case-insensitive matching: PWD is lowered before case match
         assert!(cache.contains("_pwd_lower"));
         assert!(cache.contains("tr '[:upper:]' '[:lower:]'"));
@@ -261,7 +261,7 @@ mod tests {
         let mut profiles = BTreeMap::new();
         let mut work = Profile::default();
         work.providers.insert("claude".to_string(), "/tmp/claude-work".to_string());
-        work.directories.push(root.join("appxite").to_string_lossy().to_string());
+        work.directories.push(root.join("acme").to_string_lossy().to_string());
         let mut personal = Profile::default();
         personal.providers.insert("claude".to_string(), personal_claude.to_string());
         profiles.insert("work".to_string(), work);
@@ -272,13 +272,13 @@ mod tests {
     #[test]
     fn cache_directory_match_stops_at_a_folder_boundary() {
         let root = tempfile::TempDir::new().unwrap();
-        for d in ["appxite/svc", "appxite-ideas"] {
+        for d in ["acme/svc", "acme-ideas"] {
             std::fs::create_dir_all(root.path().join(d)).unwrap();
         }
         let cache = generate_cache(&boundary_config(root.path(), "/tmp/claude-personal"));
-        assert_eq!(run_cache(&cache, &root.path().join("appxite")), "/tmp/claude-work");
-        assert_eq!(run_cache(&cache, &root.path().join("appxite/svc")), "/tmp/claude-work");
-        assert_eq!(run_cache(&cache, &root.path().join("appxite-ideas")), "/tmp/claude-personal");
+        assert_eq!(run_cache(&cache, &root.path().join("acme")), "/tmp/claude-work");
+        assert_eq!(run_cache(&cache, &root.path().join("acme/svc")), "/tmp/claude-work");
+        assert_eq!(run_cache(&cache, &root.path().join("acme-ideas")), "/tmp/claude-personal");
     }
 
     #[test]

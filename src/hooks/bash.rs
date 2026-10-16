@@ -1,7 +1,8 @@
 use crate::config;
 
-/// Generate the bash hook that sources the cache on every directory change.
-pub fn generate() -> String {
+/// Generate the bash hook that sources the cache on every directory change. With a route, `claude` goes through
+/// `aitch launch`, which picks the folder once per start.
+pub fn generate(routed: bool) -> String {
     let cache = config::cache_path();
     let cache_str = cache.to_string_lossy();
 
@@ -22,8 +23,14 @@ fi
 
 # Run once on shell startup
 _aitch_hook
-"#,
-        cache_str, cache_str
+{}"#,
+        cache_str,
+        cache_str,
+        if routed {
+            "\n# A route picks the Claude Code folder at launch\nunalias claude 2>/dev/null\nfunction claude { command aitch launch claude -- \"$@\"; }\n"
+        } else {
+            ""
+        }
     )
 }
 
@@ -33,7 +40,7 @@ mod tests {
 
     #[test]
     fn generates_valid_bash_hook() {
-        let hook = generate();
+        let hook = generate(false);
         assert!(hook.contains("PROMPT_COMMAND"));
         assert!(hook.contains("_aitch_hook"));
         assert!(hook.contains("source"));

@@ -3,8 +3,12 @@ use crate::config::{self, Config, Profile};
 use crate::hooks;
 use crate::providers;
 use crate::resolve;
+use crate::route;
 use colored::Colorize;
 use std::env;
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::Command;
 
 /// Initialize aitch: create config directory and default config.
 pub fn init() -> Result<(), Box<dyn std::error::Error>> {
@@ -183,7 +187,7 @@ pub fn remove(profile_name: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// Show the active profile for the current directory.
 pub fn status() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::load_config()?;
-    let pwd = env::current_dir()?.to_string_lossy().to_string();
+    let pwd = logical_pwd()?;
     let result = resolve::resolve(&pwd, &cfg);
 
     match result.profile_name {
@@ -207,7 +211,7 @@ pub fn status() -> Result<(), Box<dyn std::error::Error>> {
 /// Show which rule matched and the full resolution trace.
 pub fn which() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::load_config()?;
-    let pwd = env::current_dir()?.to_string_lossy().to_string();
+    let pwd = logical_pwd()?;
     let result = resolve::resolve(&pwd, &cfg);
 
     println!("{} {}", "Directory:".dimmed(), pwd);
@@ -264,10 +268,124 @@ pub fn which() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Output the shell hook for the given shell.
 pub fn hook(shell: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // A broken config must not cost the base hook: it sources the cache built from the last good config.
+    let cfg = config::load_config();
+    let routed = cfg.as_ref().is_ok_and(|c| {
+        c.profiles
+            .values()
+            .any(|p| p.route.as_ref().is_some_and(|r| r.claude.is_some()))
+    });
     match shell {
-        "zsh" => print!("{}", hooks::zsh::generate()),
-        "bash" => print!("{}", hooks::bash::generate()),
+        "zsh" => print!("{}", hooks::zsh::generate(routed)),
+        "bash" => print!("{}", hooks::bash::generate(routed)),
         _ => return Err(format!("unsupported shell: '{}' (use zsh or bash)", shell).into()),
+    }
+    cfg?;
+    Ok(())
+}
+
+/// Start `provider` for the current directory. A profile with a route picks its folder here, once, and says which
+/// and why on stderr; any other profile runs the provider with the environment the shell hook already set.
+pub fn launch(provider: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if provider != "claude" {
+        return Err(format!("launch supports claude only, not '{}'", provider).into());
+    }
+    let mut cmd = Command::new("claude");
+    // A broken config must not stop claude: run it with the folder the hook's cache (last good config) set.
+    let cfg = match config::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "{}",
+                format!("aitch: config error, no route used: {}", e)
+                    .red()
+                    .bold()
+            );
+            let err = cmd.args(args).exec();
+            return Err(format!("cannot run claude: {}", err).into());
+        }
+    };
+    let pwd = logical_pwd()?;
+    let result = resolve::resolve(&pwd, &cfg);
+    let routed = result.profile.as_ref().and_then(|p| {
+        let r = p.route.as_ref()?.claude.as_ref()?;
+        Some((r, p.providers.get("claude")?))
+    });
+    if let Some((r, fallback)) = routed {
+        let name = result.profile_name.as_deref().unwrap_or("?");
+        let fallback_dir = resolve::expand_tilde(fallback);
+        let primary_dir = resolve::expand_tilde(&r.primary);
+        let mcp = config::config_dir()
+            .join("run")
+            .join(format!("{}-mcp.json", name));
+        let choice = match route::decide(
+            r,
+            Path::new(&fallback_dir),
+            Path::new(&primary_dir),
+            &mcp,
+            || route::read_verdict(&r.quota, route::QUOTA_TIMEOUT),
+        ) {
+            route::Decision::Go(c) => c,
+            route::Decision::Refuse(why) => {
+                return Err(format!("not launching claude: {}", why).into())
+            }
+        };
+        let (which, shown) = if choice.primary {
+            ("primary", r.primary.as_str())
+        } else {
+            ("fallback", fallback.as_str())
+        };
+        let reason = if choice.loud {
+            choice.reason.red().bold().to_string()
+        } else {
+            choice.reason.clone()
+        };
+        eprintln!("aitch: {} → {} ({}): {}", name, which, shown, reason);
+        cmd.env("CLAUDE_CONFIG_DIR", &choice.dir);
+        if choice.primary {
+            // One word: --mcp-config takes values up to the next flag and would eat the user's first arguments.
+            cmd.arg(format!("--mcp-config={}", mcp.display()));
+            // The primary account's own claude.ai connectors are not part of the fallback dir's setup.
+            cmd.env("ENABLE_CLAUDEAI_MCP_SERVERS", "false");
+        }
+    }
+    let err = cmd.args(args).exec();
+    Err(format!("cannot run claude: {}", err).into())
+}
+
+/// The directory as the shell sees it ($PWD, symlinks kept), like the hook's cache; else the physical one.
+fn logical_pwd() -> std::io::Result<String> {
+    let physical = env::current_dir()?;
+    if let Ok(pwd) = env::var("PWD") {
+        if Path::new(&pwd).is_absolute()
+            && std::fs::canonicalize(&pwd).ok() == physical.canonicalize().ok()
+        {
+            return Ok(pwd);
+        }
+    }
+    Ok(physical.to_string_lossy().to_string())
+}
+
+/// Create a config folder that shares another folder's rules by symlink.
+pub fn link(from: &str, to: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let (from, to) = (resolve::expand_tilde(from), resolve::expand_tilde(to));
+    let made = route::link(Path::new(&from), Path::new(&to))?;
+    route::check_links(Path::new(&from), Path::new(&to))?;
+    if made.is_empty() {
+        println!(
+            "{} {} already links every rule from {}",
+            "done:".green().bold(),
+            to,
+            from
+        );
+    } else {
+        println!(
+            "{} linked {} in {} to {}",
+            "done:".green().bold(),
+            made.join(", "),
+            to,
+            from
+        );
     }
     Ok(())
 }

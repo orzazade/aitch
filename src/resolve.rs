@@ -46,7 +46,7 @@ pub fn resolve(pwd: &str, config: &Config) -> ResolveResult {
     for (name, profile) in &config.profiles {
         for dir in &profile.directories {
             // The folder itself or anything inside it; a sibling that only shares the
-            // prefix (appxite-ideas for appxite) is not a match.
+            // prefix (acme-ideas for acme) is not a match.
             let dir_lower = expand_tilde(dir).trim_end_matches('/').to_lowercase();
             if pwd_lower == dir_lower || pwd_lower.starts_with(&format!("{}/", dir_lower)) {
                 return ResolveResult {
@@ -165,7 +165,7 @@ fn normalize_remote(url: &str) -> String {
 }
 
 /// Expand ~ to home directory in a path string.
-fn expand_tilde(path: &str) -> String {
+pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest).to_string_lossy().to_string();
@@ -187,8 +187,8 @@ mod tests {
         let mut work = Profile::default();
         work.providers
             .insert("claude".to_string(), "/tmp/claude-work".to_string());
-        work.directories.push("/tmp/projects/appxite".to_string());
-        work.git_remotes.push("github.com/appxite/*".to_string());
+        work.directories.push("/tmp/projects/acme".to_string());
+        work.git_remotes.push("github.com/acme/*".to_string());
 
         let mut personal = Profile::default();
         personal
@@ -196,7 +196,7 @@ mod tests {
             .insert("claude".to_string(), "/tmp/claude-personal".to_string());
         personal
             .directories
-            .push("/tmp/projects/scifi".to_string());
+            .push("/tmp/projects/personal".to_string());
 
         profiles.insert("work".to_string(), work);
         profiles.insert("personal".to_string(), personal);
@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn resolve_directory_match() {
         let config = test_config();
-        let result = resolve("/tmp/projects/appxite/subdir", &config);
+        let result = resolve("/tmp/projects/acme/subdir", &config);
         assert_eq!(result.profile_name, Some("work".to_string()));
         assert!(matches!(result.rule, MatchRule::DirectoryMatch { .. }));
     }
@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn resolve_directory_match_case_insensitive() {
         let config = test_config();
-        let result = resolve("/tmp/projects/Appxite/subdir", &config);
+        let result = resolve("/tmp/projects/Acme/subdir", &config);
         assert_eq!(result.profile_name, Some("work".to_string()));
         assert!(matches!(result.rule, MatchRule::DirectoryMatch { .. }));
     }
@@ -269,16 +269,16 @@ mod tests {
     #[test]
     fn remote_matches_wildcard() {
         assert!(remote_matches(
-            "git@github.com:appxite/repo.git",
-            "github.com/appxite/*"
+            "git@github.com:acme/repo.git",
+            "github.com/acme/*"
         ));
         assert!(remote_matches(
-            "https://github.com/appxite/repo.git",
-            "github.com/appxite/*"
+            "https://github.com/acme/repo.git",
+            "github.com/acme/*"
         ));
         assert!(!remote_matches(
             "git@github.com:other/repo.git",
-            "github.com/appxite/*"
+            "github.com/acme/*"
         ));
     }
 
@@ -307,12 +307,12 @@ mod tests {
     fn directory_match_stops_at_a_folder_boundary() {
         let config = test_config();
         let work = |p: &str| resolve(p, &config).profile_name.as_deref() == Some("work");
-        assert!(work("/tmp/projects/appxite"));
-        assert!(work("/tmp/projects/appxite/svc-quote"));
-        assert!(work("/tmp/projects/APPXITE/svc-quote"));
+        assert!(work("/tmp/projects/acme"));
+        assert!(work("/tmp/projects/acme/svc-quote"));
+        assert!(work("/tmp/projects/ACME/svc-quote"));
         // A sibling folder that only shares the prefix is not inside it.
-        assert!(!work("/tmp/projects/appxite-ideas"));
-        assert!(!work("/tmp/projects/appxitenotes/x"));
+        assert!(!work("/tmp/projects/acme-ideas"));
+        assert!(!work("/tmp/projects/acmenotes/x"));
     }
 
     #[test]

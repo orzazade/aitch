@@ -17,6 +17,8 @@ pub enum ConfigError {
     InvalidProfileName(String),
     #[error("invalid path '{0}': contains shell metacharacters")]
     UnsafePath(String),
+    #[error("profile '{0}': {1}")]
+    BadRoute(String, String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -35,6 +37,30 @@ pub struct Profile {
     pub directories: Vec<String>,
     #[serde(default)]
     pub git_remotes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<Routes>,
+}
+
+/// Launch-time routes, per provider. Only Claude Code has one.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Routes {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude: Option<Route>,
+}
+
+/// Start Claude Code on `primary` while the `quota` command says its account has room, else on the profile's own
+/// `providers.claude` dir (the fallback). The org ids are optional login guards, checked against each dir's
+/// `.claude.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Route {
+    pub primary: String,
+    pub quota: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_org: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_org: Option<String>,
 }
 
 /// Returns the default config directory: ~/.aitch/
@@ -89,7 +115,38 @@ pub fn load_config_from(path: &Path) -> Result<Config, ConfigError> {
         return Ok(Config::default());
     }
     let config: Config = serde_yaml::from_str(&contents)?;
+    check_routes(&config)?;
     Ok(config)
+}
+
+/// A route needs every field and the profile's own Claude folder to fall back to.
+fn check_routes(config: &Config) -> Result<(), ConfigError> {
+    for (name, profile) in &config.profiles {
+        let Some(route) = profile.route.as_ref().and_then(|r| r.claude.as_ref()) else {
+            continue;
+        };
+        let bad = |why: &str| ConfigError::BadRoute(name.clone(), why.to_string());
+        for (field, value) in [
+            ("primary", Some(&route.primary)),
+            ("quota", Some(&route.quota)),
+            ("primary_org", route.primary_org.as_ref()),
+            ("fallback_org", route.fallback_org.as_ref()),
+        ] {
+            if value.is_some_and(|v| v.trim().is_empty()) {
+                return Err(bad(&format!("route.claude.{field} is empty")));
+            }
+        }
+        if profile
+            .providers
+            .get("claude")
+            .is_none_or(|d| d.trim().is_empty())
+        {
+            return Err(bad(
+                "route.claude needs providers.claude, the dir to fall back to",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Save config to disk. Creates the config directory if needed.
@@ -194,10 +251,10 @@ mod tests {
             .insert("claude".to_string(), "~/.claude-work".to_string());
         profile
             .directories
-            .push("~/Projects/appxite".to_string());
+            .push("~/Projects/acme".to_string());
         profile
             .git_remotes
-            .push("github.com/appxite/*".to_string());
+            .push("github.com/acme/*".to_string());
 
         add_profile(&mut config, "work", profile).unwrap();
         save_config_to(&config, &path).unwrap();
@@ -217,6 +274,66 @@ mod tests {
         let path = dir.path().join("config.yaml");
         fs::write(&path, "{{invalid yaml: [}").unwrap();
         assert!(load_config_from(&path).is_err());
+    }
+
+    #[test]
+    fn route_roundtrips_and_is_optional() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.yaml");
+        let yaml = "profiles:\n  work:\n    providers: { claude: /w }\n    route:\n      claude:\n        primary: /m\n        primary_org: a\n        fallback_org: b\n        quota: q --room\n  personal: {}\n";
+        fs::write(&path, yaml).unwrap();
+        let cfg = load_config_from(&path).unwrap();
+        let r = cfg.profiles["work"]
+            .route
+            .as_ref()
+            .unwrap()
+            .claude
+            .as_ref()
+            .unwrap();
+        assert_eq!((r.primary.as_str(), r.quota.as_str()), ("/m", "q --room"));
+        assert!(cfg.profiles["personal"].route.is_none());
+        save_config_to(&cfg, &path).unwrap();
+        let again = load_config_from(&path).unwrap();
+        assert_eq!(
+            again.profiles["work"]
+                .route
+                .as_ref()
+                .unwrap()
+                .claude
+                .as_ref()
+                .unwrap()
+                .primary_org
+                .as_deref(),
+            Some("a")
+        );
+        assert!(!fs::read_to_string(&path)
+            .unwrap()
+            .contains("personal:\n    route"));
+    }
+
+    #[test]
+    fn route_with_missing_or_empty_field_fails_at_load() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.yaml");
+        let base = "profiles:\n  work:\n    providers: { claude: /w }\n    route:\n      claude:\n        primary: /m\n";
+        fs::write(&path, base).unwrap();
+        assert!(load_config_from(&path).is_err(), "quota missing");
+        fs::write(&path, format!("{base}        quota: ''\n")).unwrap();
+        assert!(load_config_from(&path).is_err(), "quota empty");
+        let no_provider =
+            base.replace("    providers: { claude: /w }\n", "") + "        quota: q\n";
+        fs::write(&path, no_provider).unwrap();
+        assert!(load_config_from(&path).is_err(), "no providers.claude");
+        fs::write(&path, format!("{base}        quota: q\n")).unwrap();
+        assert!(load_config_from(&path).is_ok(), "org guards are optional");
+        fs::write(
+            &path,
+            format!("{base}        quota: q\n        fallback_org: ''\n"),
+        )
+        .unwrap();
+        assert!(load_config_from(&path).is_err(), "org given but empty");
+        fs::write(&path, format!("{base}        quota: q\n        typo: 1\n")).unwrap();
+        assert!(load_config_from(&path).is_err(), "unknown field");
     }
 
     #[test]

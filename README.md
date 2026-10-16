@@ -66,6 +66,8 @@ The shell hook runs on every `cd` and sources a pre-compiled cache file. Static 
 | `aitch which` | Show which rule matched and why |
 | `aitch hook zsh` | Output zsh hook (for .zshrc) |
 | `aitch hook bash` | Output bash hook (for .bashrc) |
+| `aitch link <from> <to>` | Make `<to>` a Claude Code config dir that shares `<from>`'s rules by symlink |
+| `aitch launch claude -- <args>` | Start Claude Code with the dir a route picks (the hook's `claude` calls this) |
 
 ## Config
 
@@ -92,6 +94,74 @@ profiles:
     git_remotes:
       - "github.com/myusername/*"
 ```
+
+## Routing by quota (Claude Code)
+
+A profile can start Claude Code on a second account while that account has quota left, and on the profile's own
+account otherwise. The choice is made once, when `claude` starts; a running session is never switched.
+
+```yaml
+profiles:
+  work:
+    providers:
+      claude: ~/.claude-work         # the fallback dir
+    directories:
+      - ~/Projects/work
+    route:
+      claude:
+        primary: ~/.claude-alt       # used while the quota command says "room"
+        quota: ~/bin/my-quota --room # see the contract below
+        primary_org: <org id>        # optional: the login the primary dir must hold
+        fallback_org: <org id>       # optional: the login the fallback dir must hold
+```
+
+Set it up once:
+
+```bash
+aitch link ~/.claude-work ~/.claude-alt         # share the fallback dir's rules
+CLAUDE_CONFIG_DIR=~/.claude-alt command claude  # then /login with the second account
+```
+
+`aitch link` creates the primary dir with symlinks to the fallback dir's `CLAUDE.md`, `settings.json`, `agents`,
+`skills`, `commands`, `hooks`, `output-styles`, `plugins` and `projects` (each one that exists). The login
+(`.claude.json` and the keychain entry) stays separate. It never replaces a file that is not the right link. MCP
+servers live next to the login, so on each launch in the primary dir aitch passes the fallback dir's `mcpServers`
+with `--mcp-config` (a file under `~/.aitch/run/`, mode 0600, rewritten on each launch), and sets
+`ENABLE_CLAUDEAI_MCP_SERVERS=false` so the second account's own claude.ai connectors stay out.
+
+With a route, the shell hook defines a `claude` function that calls `aitch launch claude`. It prints one line to
+stderr on every launch, saying which dir it picked and why:
+
+```
+aitch: work → primary (~/.claude-alt): 7d 43%, 5h 9%, sample 1 min old
+aitch: work → fallback (~/.claude-work): quota full: 7d 100%
+aitch: work → fallback (~/.claude-work): QUOTA UNKNOWN: exit 4: no sample. Not using the primary dir.
+```
+
+The fallback dir is used when the quota answer is anything but a clear "room": the command fails or is missing,
+takes longer than 3 seconds, or prints something unexpected. It is also used when a link in the primary dir was
+replaced or points elsewhere, or when the primary dir's login is not `primary_org`. If the fallback dir's login is
+not `fallback_org`, aitch does not start Claude Code at all. Anything that runs the `claude` binary directly gets
+the hook's plain `CLAUDE_CONFIG_DIR`, which is the fallback dir. If the config does not load, `claude` still starts with that
+plain value, after a red warning.
+
+### Quota command contract
+
+Any tool can be the quota command. aitch runs it without a shell (the string is split on spaces, `~` is expanded)
+and reads one JSON line from stdout:
+
+```json
+{"verdict": "room", "reason": "7d 43%, 5h 9%, sample 1 min old"}
+```
+
+| Exit | `verdict` | aitch uses |
+|------|-----------|------------|
+| 0 | `room` | the primary dir |
+| 3 | `full` | the fallback dir |
+| 4 | `unknown` | the fallback dir, and says so loudly |
+| any other, or no valid JSON | — | the fallback dir, loudly (it shows the first stderr line) |
+
+`reason` is printed as is, so keep it to one short line. Other fields are ignored.
 
 ## Supported Providers
 
