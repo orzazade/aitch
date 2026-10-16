@@ -6,7 +6,7 @@ use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{symlink, OpenOptionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -236,8 +236,8 @@ pub fn link(from: &Path, to: &Path) -> Result<Vec<String>, String> {
 }
 
 /// Write `{"mcpServers": …}` from `fallback_dir/.claude.json` to `out`, mode 0600, replacing it atomically: the
-/// user-scope servers, then the local-scope ones of `folders` (the launch folder, as the shell and as the disk name
-/// it), which win on a shared name as they do in Claude Code.
+/// user-scope servers, then the local-scope ones filed under `folders` (the launch folder's project, see
+/// `project_key`), which win on a shared name as they do in Claude Code.
 pub fn write_mcp(fallback_dir: &Path, folders: &[String], out: &Path) -> Result<(), String> {
     let json = claude_json(fallback_dir)?;
     let mut servers = serde_json::Map::new();
@@ -282,21 +282,41 @@ pub fn write_mcp(fallback_dir: &Path, folders: &[String], out: &Path) -> Result<
 }
 
 /// The folder Claude Code files a launch folder's local state under: the nearest folder above it (or itself) holding
-/// `.git`, unless that is the home folder; else the launch folder.
+/// `.git` (for a linked worktree, its main repo), unless that is the home folder; else the launch folder.
 pub fn project_key(cwd: &Path, home: &Path) -> String {
     let root = cwd
         .ancestors()
         .find(|d| fs::symlink_metadata(d.join(".git")).is_ok())
+        .map(main_worktree)
         .filter(|d| fs::canonicalize(d).ok() != fs::canonicalize(home).ok());
-    root.unwrap_or(cwd).to_string_lossy().to_string()
+    root.unwrap_or_else(|| cwd.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+/// A linked worktree's `.git` file names `<repo>/.git/worktrees/<name>`, whose `commondir` leads to the repo's `.git`.
+/// Any other `.git` (a folder, or a submodule's file) keeps `dir`.
+fn main_worktree(dir: &Path) -> PathBuf {
+    let common = fs::read_to_string(dir.join(".git"))
+        .ok()
+        .and_then(|s| s.strip_prefix("gitdir:").map(|g| dir.join(g.trim())))
+        .and_then(|g| {
+            let c = fs::read_to_string(g.join("commondir")).ok()?;
+            fs::canonicalize(g.join(c.trim())).ok()
+        });
+    common
+        .and_then(|c| c.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| dir.to_path_buf())
 }
 
 /// Mark as trusted in `to` every folder that `from` trusts and that is one of `folders` or a parent of one, so the
 /// launch does not ask "trust this folder?" again. Writes `to/.claude.json` only when that changes something, keeps
 /// its other fields and its mode. Returns the folders it marked.
 pub fn share_trust(from: &Path, to: &Path, folders: &[String]) -> Result<Vec<String>, String> {
-    if fs::symlink_metadata(from.join(".claude.json")).is_err() {
-        return Ok(vec![]);
+    if let Err(e) = fs::symlink_metadata(from.join(".claude.json")) {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Ok(vec![]);
+        }
     }
     let src = claude_json(from)?;
     let Some(trusted) = src["projects"].as_object() else {
@@ -405,7 +425,8 @@ fn write_trust(
         f.sync_all()?;
         // Another writer that skipped the lock: keep its version.
         let now = fs::metadata(path)?;
-        if now.modified()? != meta.modified()? || now.len() != meta.len() {
+        if now.modified()? != meta.modified()? || now.len() != meta.len() || now.ino() != meta.ino()
+        {
             return Ok(false);
         }
         fs::rename(&tmp, path)?;
@@ -1117,5 +1138,58 @@ mod tests {
         );
         let err = write_mcp(&s.fallback, &["/r".to_string()], &s.mcp).unwrap_err();
         assert!(err.contains("projects") && err.contains("/r"), "{err}");
+    }
+
+    #[test]
+    fn project_key_of_a_linked_worktree_is_its_main_repo() {
+        let s = setup();
+        let main = s.root.join("main");
+        let meta = main.join(".git/worktrees/wt");
+        fs::create_dir_all(&meta).unwrap();
+        fs::write(meta.join("commondir"), "../..\n").unwrap();
+        let wt = s.root.join("elsewhere/wt");
+        fs::create_dir_all(wt.join("sub")).unwrap();
+        fs::write(wt.join(".git"), format!("gitdir: {}\n", meta.display())).unwrap();
+        let main = fs::canonicalize(&main).unwrap();
+        assert_eq!(
+            project_key(&wt.join("sub"), &s.root),
+            main.to_string_lossy()
+        );
+        // A .git file without commondir (a submodule) keeps its own folder.
+        let module = s.root.join("module");
+        fs::create_dir_all(&module).unwrap();
+        fs::create_dir_all(s.root.join("super/.git/modules/m")).unwrap();
+        fs::write(module.join(".git"), "gitdir: ../super/.git/modules/m\n").unwrap();
+        assert_eq!(project_key(&module, &s.root), module.to_string_lossy());
+    }
+
+    #[test]
+    fn sharing_trust_keeps_the_order_of_keys() {
+        let s = setup();
+        let from = s.fallback.join(".claude.json");
+        let mut f = read_json(&from);
+        f["projects"] = serde_json::json!({"/r": {"hasTrustDialogAccepted": true}});
+        write_json(&from, f);
+        let to = s.primary.join(".claude.json");
+        fs::write(
+            &to,
+            r#"{"zeta": 1, "alpha": {"y": 1, "b": 2}, "projects": {}}"#,
+        )
+        .unwrap();
+        share_trust(&s.fallback, &s.primary, &["/r".to_string()]).unwrap();
+        let body = fs::read_to_string(&to).unwrap();
+        let at = |k: &str| body.find(k).unwrap();
+        assert!(
+            at("zeta") < at("alpha") && at("\"y\"") < at("\"b\""),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn only_a_missing_login_file_means_nothing_to_share() {
+        let s = setup();
+        let not_a_dir = s.root.join("file");
+        fs::write(&not_a_dir, "").unwrap();
+        assert!(share_trust(&not_a_dir, &s.primary, &["/r".to_string()]).is_err());
     }
 }

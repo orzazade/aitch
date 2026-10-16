@@ -138,7 +138,8 @@ Claude Code keeps per-folder trust in each dir's `.claude.json`. If the other di
 folder or a folder above it, aitch marks the same folders as trusted in the dir it picked, so you are not asked again. It writes
 `.claude.json` only when that changes something, under the lock Claude Code uses for it. `claude mcp …` runs on the
 fallback dir (put `mcp` first, before any flag), since primary launches read their servers from there: user scope,
-and local scope for the launch folder's project (its git repo root, as Claude Code files it).
+and local scope for the launch folder's project (its git repo root, or a worktree's main repo, as Claude Code
+files it).
 
 With a route, the shell hook defines a `claude` function that calls `aitch launch claude`. It prints one line to
 stderr on every launch, saying which dir it picked and why:

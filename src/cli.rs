@@ -331,9 +331,7 @@ pub fn launch(provider: &str, args: &[String]) -> Result<(), Box<dyn std::error:
         }
         // Local-scope MCP servers are filed under the git root, as Claude Code does.
         let home = dirs::home_dir().unwrap_or_default();
-        let project = env::current_dir()
-            .map(|d| route::project_key(&d, &home))
-            .unwrap_or_else(|_| pwd.clone());
+        let project = route::project_key(&env::current_dir()?, &home);
         let choice = if args.first().is_some_and(|a| a == "mcp") {
             // `claude mcp` edits the servers; primary launches read them from the fallback dir.
             if let Some(want) = &r.fallback_org {

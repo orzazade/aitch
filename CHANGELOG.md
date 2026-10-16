@@ -12,7 +12,7 @@
 - `aitch link <from> <to>`: make a Claude Code config dir that shares another one's rules by symlink.
 - `aitch launch claude -- <args>`: what the hook's `claude` function calls.
 - On a primary launch, the fallback dir's MCP servers (user scope, and local scope for the launch folder's git
-  repo) are passed with `--mcp-config`, and the primary account's claude.ai connectors stay out.
+  repo, or a worktree's main repo) are passed with `--mcp-config`, and the primary account's claude.ai connectors stay out.
 - At launch, a folder (or a folder above it) that the other dir of the route trusts is marked trusted in the dir
   the launch picked, so Claude Code does not ask again.
 - `claude mcp …` (with `mcp` first) in a routed folder runs on the fallback dir, where primary launches read the
