@@ -60,10 +60,13 @@ mod tests {
         let snippet = claude_shim(Some(Path::new(d)));
         for shell in ["/bin/bash", "/bin/zsh"] {
             for (path, want) in cases {
+                // Set inside the script: Debian's zsh replaces an empty PATH it starts with.
                 let out = Command::new(shell)
                     .arg("-c")
-                    .arg(format!("{snippet}\nprintf %s \"$PATH\""))
-                    .env("PATH", path)
+                    .arg(format!(
+                        "PATH='{}'\n{snippet}\nprintf %s \"$PATH\"",
+                        shell_escape(path)
+                    ))
                     .output()
                     .unwrap();
                 assert_eq!(
