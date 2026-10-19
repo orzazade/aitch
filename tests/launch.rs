@@ -255,11 +255,13 @@ fn work_folder_on_wrong_account_refuses_to_launch() {
 }
 
 #[test]
-fn hook_defines_claude_only_with_a_route() {
+fn hook_puts_the_claude_shim_on_path_only_with_a_route() {
     let e = Env::new(ROOM);
     for shell in ["zsh", "bash"] {
         let hook = text(&e.run(&e.home, &["hook", shell]).stdout);
-        assert!(hook.contains("function claude {"), "{shell}: {hook}");
+        assert!(hook.contains("/.aitch/bin"), "{shell}: {hook}");
+        // A shell function named claude is replaced by terminals that wrap claude (cmux does at the first prompt).
+        assert!(!hook.contains("function claude"), "{shell}: {hook}");
         let check = Command::new(shell)
             .arg("-n")
             .arg("-c")
@@ -275,33 +277,344 @@ fn hook_defines_claude_only_with_a_route() {
     e.write_config(false);
     for shell in ["zsh", "bash"] {
         let hook = text(&e.run(&e.home, &["hook", shell]).stdout);
-        assert!(!hook.contains("function claude"), "{shell}: {hook}");
+        assert!(!hook.contains("claude"), "{shell}: {hook}");
     }
 }
 
 #[test]
-fn shell_function_routes_through_launch() {
+fn plain_claude_after_the_hook_is_the_shim_and_routes() {
     let e = Env::new(ROOM);
     let aitch_dir = Path::new(AITCH).parent().unwrap();
-    let out = Command::new("bash")
-        .arg("-c")
-        .arg("eval \"$(aitch hook bash)\"; claude --resume 'a b'")
-        .current_dir(&e.acme)
-        .env("HOME", &e.home)
-        .env(
-            "PATH",
-            format!("{}:{}:/usr/bin:/bin", aitch_dir.display(), e.bin.display()),
-        )
-        .env("NO_COLOR", "1")
-        .locked_output()
+    let shim = e.home.join(".aitch/bin/claude");
+    for (shell, kind) in [("bash", "type -P claude"), ("zsh", "whence -p claude")] {
+        let out = Command::new(shell)
+            .arg("-c")
+            .arg(format!(
+                "eval \"$(aitch hook {shell})\"; {kind}; claude --resume 'a b'"
+            ))
+            .current_dir(&e.acme)
+            .env("HOME", &e.home)
+            .env(
+                "PATH",
+                format!("{}:{}:/usr/bin:/bin", aitch_dir.display(), e.bin.display()),
+            )
+            .env("NO_COLOR", "1")
+            .locked_output()
+            .unwrap();
+        let so = text(&out.stdout);
+        assert!(
+            so.starts_with(&format!("{}\n", shim.display())),
+            "{shell}: {so} {}",
+            text(&out.stderr)
+        );
+        assert!(
+            so.contains(&format!("DIR={}\n", e.primary_s())),
+            "{shell}: {so}"
+        );
+        assert!(so.contains("ARG=--resume\nARG=a b\n"), "{shell}: {so}");
+    }
+}
+
+/// A folder with `claude` linked to aitch, as the hook makes it.
+fn shim_in(dir: &Path) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    let link = dir.join("claude");
+    std::os::unix::fs::symlink(AITCH, &link).unwrap();
+    link
+}
+
+impl Env {
+    /// Run `claude` through a shim at `program` with only `path` (then /usr/bin:/bin) on PATH.
+    fn claude(&self, program: &Path, path: &[&Path], args: &[&str]) -> Command {
+        let dirs: Vec<String> = path.iter().map(|p| p.display().to_string()).collect();
+        let mut c = Command::new(program);
+        c.args(args)
+            .current_dir(&self.acme)
+            .env("HOME", &self.home)
+            .env("PATH", format!("{}:/usr/bin:/bin", dirs.join(":")))
+            .env("NO_COLOR", "1")
+            .env("CLAUDE_CONFIG_DIR", "/inherited")
+            .env_remove("CMUX_CLAUDE_WRAPPER_SHIM")
+            .env_remove("AITCH_CLAUDE_CHAIN");
+        c
+    }
+}
+
+/// Output, or a panic after 20 s: a launch loop must fail the test, not hang it.
+fn within_20s(c: &mut Command) -> Output {
+    use std::process::Stdio;
+    let child = c
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .locked_spawn()
         .unwrap();
-    let so = text(&out.stdout);
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(child.wait_with_output()));
+    match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok(out) => out.unwrap(),
+        Err(_) => {
+            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            panic!("claude did not finish in 20 s: a launch loop");
+        }
+    }
+}
+
+const COUNTED_ROOM: &str =
+    "echo x >> \"$HOME/asked\"\necho '{\"verdict\":\"room\",\"reason\":\"7d 43%\"}'\n";
+
+fn quota_runs(e: &Env) -> usize {
+    fs::read_to_string(e.home.join("asked"))
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn claude_through_the_shim_routes() {
+    let e = Env::new(COUNTED_ROOM);
+    let shim = shim_in(&e.home.join("shim"));
+    let out =
+        within_20s(&mut e.claude(&shim, &[&e.home.join("shim"), &e.bin], &["--resume", "a b"]));
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "{se}");
     assert!(
         so.contains(&format!("DIR={}\n", e.primary_s())),
-        "{so} {}",
-        text(&out.stderr)
+        "{so} {se}"
     );
+    assert!(so.contains("CONNECTORS=false\n"), "{so}");
     assert!(so.contains("ARG=--resume\nARG=a b\n"), "{so}");
+    assert!(se.contains("aitch: work → primary"), "{se}");
+    assert_eq!(quota_runs(&e), 1);
+}
+
+#[test]
+fn the_shim_skips_aitch_itself_and_cmux_shims() {
+    let e = Env::new(ROOM);
+    let shim = shim_in(&e.home.join("shim"));
+    // Another link to aitch, cmux's per-tab shim (found by its path) and a shim cmux names in its environment.
+    let again = e.home.join("again");
+    shim_in(&again);
+    let tab = e.home.join(".cmuxterm/cmux-cli-shims/ABC");
+    let named = e.home.join("named");
+    for d in [&tab, &named] {
+        fs::create_dir_all(d).unwrap();
+        script(&d.join("claude"), "echo CMUX\nexit 9\n");
+    }
+    // As cmux's wrapper starts the claude it found: CMUX_CLAUDE_PID is its pid, which exec keeps.
+    let as_cmux = "export CMUX_CLAUDE_PID=$$; exec \"$0\" \"$@\"";
+    let out = within_20s(
+        e.claude(
+            Path::new("/bin/sh"),
+            &[&e.home.join("shim"), &again, &tab, &named, &e.bin],
+            &["-c", as_cmux, &shim.to_string_lossy()],
+        )
+        .env("CMUX_CLAUDE_WRAPPER_SHIM", named.join("claude")),
+    );
+    let so = text(&out.stdout);
+    assert!(out.status.success(), "{so} {}", text(&out.stderr));
+    assert!(!so.contains("CMUX"), "{so}");
+    assert!(so.contains(&format!("DIR={}\n", e.primary_s())), "{so}");
+}
+
+#[test]
+fn a_shell_that_reaches_the_shim_first_still_runs_cmux_wrapper_once() {
+    let e = Env::new(COUNTED_ROOM);
+    let shim = shim_in(&e.home.join("shim"));
+    // cmux's per-tab shim acting as cmux's wrapper: it adds its settings and starts the claude its lookup finds.
+    let tab = e.home.join(".cmuxterm/cmux-cli-shims/ABC");
+    fs::create_dir_all(&tab).unwrap();
+    script(
+        &tab.join("claude"),
+        &format!(
+            "echo CMUX-WRAPPER\nexport CMUX_CLAUDE_PID=$$\nexec '{}' --settings cmux \"$@\"\n",
+            shim.display()
+        ),
+    );
+    let out = within_20s(&mut e.claude(&shim, &[&e.home.join("shim"), &tab, &e.bin], &["x"]));
+    let so = text(&out.stdout);
+    assert!(out.status.success(), "{so} {}", text(&out.stderr));
+    assert_eq!(so.matches("CMUX-WRAPPER").count(), 1, "{so}");
+    assert!(so.contains(&format!("DIR={}\n", e.primary_s())), "{so}");
+    assert_eq!(so.matches("ARG=--settings\n").count(), 1, "{so}");
+    assert_eq!(so.matches("ARG=--mcp-config=").count(), 1, "{so}");
+    assert!(so.ends_with("ARG=x\n"), "{so}");
+    assert_eq!(quota_runs(&e), 1);
+}
+
+#[test]
+fn the_shim_fails_loudly_when_no_real_claude_is_on_path() {
+    let e = Env::new(COUNTED_ROOM);
+    let shim = shim_in(&e.home.join("shim"));
+    let out = within_20s(&mut e.claude(&shim, &[&e.home.join("shim")], &[]));
+    let se = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(127), "{se}");
+    assert!(se.contains("no claude found on PATH"), "{se}");
+}
+
+#[test]
+fn the_shim_passes_the_exit_code_of_claude_through() {
+    let e = Env::new(ROOM);
+    let shim = shim_in(&e.home.join("shim"));
+    let out = within_20s(
+        e.claude(&shim, &[&e.home.join("shim"), &e.bin], &[])
+            .env("FAKE_EXIT", "7"),
+    );
+    assert_eq!(out.status.code(), Some(7), "{}", text(&out.stderr));
+}
+
+#[test]
+fn a_wrapper_that_runs_claude_again_does_not_loop_or_route_twice() {
+    let e = Env::new(COUNTED_ROOM);
+    let shim = shim_in(&e.home.join("shim"));
+    // Like cmux's wrapper: it runs `claude` from PATH again, which finds the shim.
+    let wrap = e.home.join("wrap");
+    fs::create_dir_all(&wrap).unwrap();
+    script(&wrap.join("claude"), "exec claude \"$@\"\n");
+    let out = within_20s(&mut e.claude(&shim, &[&e.home.join("shim"), &wrap, &e.bin], &["x"]));
+    let so = text(&out.stdout);
+    assert!(out.status.success(), "{so} {}", text(&out.stderr));
+    assert!(so.contains(&format!("DIR={}\n", e.primary_s())), "{so}");
+    assert_eq!(so.matches("ARG=--mcp-config=").count(), 1, "{so}");
+    assert!(so.ends_with("ARG=x\n"), "{so}");
+    assert_eq!(quota_runs(&e), 1);
+}
+
+#[test]
+fn a_shell_with_the_old_claude_function_routes_once() {
+    let e = Env::new(COUNTED_ROOM);
+    let aitch_dir = Path::new(AITCH).parent().unwrap();
+    let shim_dir = e.home.join(".aitch/bin");
+    shim_in(&shim_dir);
+    // What `aitch hook` printed before the shim; shells started then keep it.
+    let old = "function claude { command aitch launch claude -- \"$@\"; }";
+    let out = within_20s(
+        Command::new("bash")
+            .arg("-c")
+            .arg(format!("{old}; claude x"))
+            .current_dir(&e.acme)
+            .env("HOME", &e.home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:{}:/usr/bin:/bin",
+                    shim_dir.display(),
+                    aitch_dir.display(),
+                    e.bin.display()
+                ),
+            )
+            .env("NO_COLOR", "1")
+            .env_remove("AITCH_CLAUDE_CHAIN"),
+    );
+    let so = text(&out.stdout);
+    assert!(out.status.success(), "{so} {}", text(&out.stderr));
+    assert!(so.contains(&format!("DIR={}\n", e.primary_s())), "{so}");
+    assert_eq!(so.matches("ARG=--mcp-config=").count(), 1, "{so}");
+    assert_eq!(quota_runs(&e), 1);
+}
+
+#[test]
+fn the_hook_moves_an_inherited_shim_folder_back_to_the_front() {
+    let e = Env::new(ROOM);
+    let aitch_dir = Path::new(AITCH).parent().unwrap();
+    let shim_dir = e.home.join(".aitch/bin");
+    shim_in(&shim_dir);
+    // A nested shell inherits the shim folder, then its startup files put another claude ahead of it.
+    let path = format!(
+        "{}:{}:{}:/usr/bin:/bin",
+        e.bin.display(),
+        shim_dir.display(),
+        aitch_dir.display()
+    );
+    for shell in ["bash", "zsh"] {
+        let out = within_20s(
+            Command::new(shell)
+                .arg("-c")
+                .arg(format!(
+                    "eval \"$(aitch hook {shell})\"; echo \"P=$PATH\"; claude x"
+                ))
+                .current_dir(&e.acme)
+                .env("HOME", &e.home)
+                .env("PATH", &path)
+                .env("NO_COLOR", "1")
+                .env_remove("AITCH_CLAUDE_CHAIN"),
+        );
+        let so = text(&out.stdout);
+        assert!(
+            so.contains(&format!(
+                "P={}:{}:{}:/usr/bin:/bin\n",
+                shim_dir.display(),
+                e.bin.display(),
+                aitch_dir.display()
+            )),
+            "{shell}: {so}"
+        );
+        assert!(
+            so.contains(&format!("DIR={}\n", e.primary_s())),
+            "{shell}: {so}"
+        );
+    }
+}
+
+#[test]
+fn a_wrapper_in_a_folder_named_with_a_newline_does_not_loop() {
+    let e = Env::new(COUNTED_ROOM);
+    let shim = shim_in(&e.home.join("shim"));
+    // A newline once split the chain's entries. (macOS refuses names that are not UTF-8, the other case.)
+    let wrap = e.home.join("wr\nap");
+    fs::create_dir_all(&wrap).unwrap();
+    script(&wrap.join("claude"), "exec claude \"$@\"\n");
+    let out = within_20s(&mut e.claude(&shim, &[&e.home.join("shim"), &wrap, &e.bin], &["x"]));
+    let so = text(&out.stdout);
+    assert!(out.status.success(), "{so} {}", text(&out.stderr));
+    assert!(so.ends_with("ARG=x\n"), "{so}");
+    assert_eq!(quota_runs(&e), 1);
+}
+
+#[test]
+fn a_wrapper_that_changes_folder_still_reaches_the_next_claude() {
+    let e = Env::new(ROOM);
+    let shim = shim_in(&e.home.join("shim"));
+    // Relative PATH entry `bin`: from pkg it is pkg/bin, whose claude moves up a folder, where it is the real one.
+    let pkg = e.home.join("pkg");
+    fs::create_dir_all(pkg.join("bin")).unwrap();
+    script(&pkg.join("bin/claude"), "cd ..\nexec claude \"$@\"\n");
+    let out = within_20s(
+        e.claude(&shim, &[&e.home.join("shim"), Path::new("bin")], &["x"])
+            .current_dir(&pkg),
+    );
+    let so = text(&out.stdout);
+    assert!(out.status.success(), "{so} {}", text(&out.stderr));
+    assert!(so.ends_with("ARG=x\n"), "{so}");
+}
+
+#[test]
+fn an_empty_path_entry_finds_claude_in_the_current_folder() {
+    let e = Env::new(ROOM);
+    let shim = shim_in(&e.home.join("shim"));
+    let out = within_20s(
+        e.claude(&shim, &[&e.home.join("shim"), Path::new("")], &["x"])
+            .current_dir(&e.bin),
+    );
+    let so = text(&out.stdout);
+    assert!(out.status.success(), "{so} {}", text(&out.stderr));
+    assert!(so.ends_with("ARG=x\n"), "{so}");
+}
+
+#[test]
+fn the_shim_skips_a_claude_this_user_cannot_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = Env::new(ROOM);
+    let shim = shim_in(&e.home.join("shim"));
+    // Runnable by group and others, not by its owner (this user).
+    let locked = e.home.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    script(&locked.join("claude"), "echo LOCKED\n");
+    fs::set_permissions(locked.join("claude"), fs::Permissions::from_mode(0o055)).unwrap();
+    let out = within_20s(&mut e.claude(&shim, &[&e.home.join("shim"), &locked, &e.bin], &["x"]));
+    let so = text(&out.stdout);
+    assert!(out.status.success(), "{so} {}", text(&out.stderr));
+    assert!(so.contains(&format!("DIR={}\n", e.primary_s())), "{so}");
 }
 
 #[test]
@@ -344,12 +657,11 @@ fn launch_resolves_the_logical_directory_like_the_hook() {
 }
 
 #[test]
-fn hook_function_is_safe_from_an_existing_alias() {
+fn hook_shim_is_safe_from_an_existing_alias() {
     let e = Env::new(ROOM);
     for shell in ["zsh", "bash"] {
         let hook = text(&e.run(&e.home, &["hook", shell]).stdout);
         assert!(hook.contains("unalias claude"), "{shell}: {hook}");
-        assert!(hook.contains("function claude {"), "{shell}: {hook}");
     }
 }
 

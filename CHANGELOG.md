@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Routing now works in terminals that set up their own `claude` shell function, such as cmux. In cmux, the hook's
+  `claude` function was replaced at the first prompt, so `claude` started on the fallback folder. The hook no longer
+  defines a function. It links `~/.aitch/bin/claude` to aitch and puts `~/.aitch/bin` first on `PATH`, so
+  `type claude` shows `~/.aitch/bin/claude`. aitch run as `claude` routes, then starts the next `claude` on `PATH`.
+  It skips itself and files it already started, so a wrapper that runs `claude` again does not loop. If no other
+  `claude` is found, it exits with code 127.
+
+To upgrade, install the new binary and open a new shell. You do not need to change `~/.zshrc` or `~/.bashrc`.
+Shells that are already open keep the old `claude` function, which still routes once.
+
 ## 0.2.1 — 2026-10-20
 
 ### Fixed

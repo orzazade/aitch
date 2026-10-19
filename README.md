@@ -162,7 +162,7 @@ Each provider sets one variable, the one the tool itself reads:
 | `aitch which` | Show the profile for the current folder and the rule that picked it. |
 | `aitch hook zsh` / `aitch hook bash` | Print the shell hook. Put it in `~/.zshrc` or `~/.bashrc` with `eval`. |
 | `aitch link <from> <to>` | Make `<to>` a Claude Code config folder that shares `<from>`'s rules by symlink. |
-| `aitch launch claude [-- args]` | Start Claude Code with the folder a route picks. The hook's `claude` function calls this. |
+| `aitch launch claude [-- args]` | Start Claude Code with the folder a route picks, as `claude` does after the hook. |
 
 Every command takes `--help`.
 
@@ -192,7 +192,7 @@ Providers:
 aitch compiles the config into a small shell script, `~/.aitch/cache`, and the hook sources that script when the
 folder changes (zsh `chpwd`, bash `PROMPT_COMMAND`), so a `cd` doesn't run aitch itself. The script is rebuilt by
 `init`, `add`, `default` and `remove`, and by `aitch hook` in every new shell. On `cd` the hook only sets
-variables. With a [route](#routing-by-quota-claude-code) in the config, it also defines a `claude` function.
+variables. With a [route](#routing-by-quota-claude-code) in the config, it also puts a `claude` shim first on `PATH`.
 
 ## Share a profile through the repo
 
@@ -239,8 +239,11 @@ CLAUDE_CONFIG_DIR=~/.claude-alt command claude  # then /login with the second ac
 `settings.json`, `agents`, `skills`, `commands`, `hooks`, `output-styles`, `plugins` and `projects`. The login
 (`.claude.json` and the keychain entry) stays separate. It never replaces a file that isn't already the right link.
 
-With a route in the config, the hook also defines a `claude` shell function that calls `aitch launch claude`. Each
-launch prints one line to stderr with the folder it picked and why:
+With a route in the config, the hook links `~/.aitch/bin/claude` to aitch and puts `~/.aitch/bin` first on `PATH`,
+so `type claude` shows `~/.aitch/bin/claude`. When aitch runs as `claude`, it picks the folder and then starts the
+next `claude` on `PATH`. This also works in terminals that set up their own `claude` shell function, such as cmux:
+their wrapper finds the shim on `PATH`. `aitch launch claude -- <args>` does the same thing by name. Each launch
+prints one line to stderr with the folder it picked and why:
 
 ```text
 aitch: work → primary (~/.claude-alt): 7d 43%, 5h 9%
@@ -263,8 +266,9 @@ folder, `claude mcp …` always runs there. Put `mcp` first, before any flag.
 Folder trust carries over too. If the other folder of the route already trusts the launch folder (or one above
 it), aitch marks it trusted in the folder it picked, so Claude Code doesn't ask again.
 
-Anything that runs the `claude` binary directly, not through the shell function, gets the fallback folder from
-`CLAUDE_CONFIG_DIR`.
+A program that starts Claude Code by its full path (not `claude` from `PATH`), or that runs without the hook's
+`PATH`, gets the fallback folder from `CLAUDE_CONFIG_DIR`. If no other `claude` is on `PATH`, the shim says so and
+exits with code 127.
 
 ### Quota command contract
 

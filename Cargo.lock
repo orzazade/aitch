@@ -20,6 +20,7 @@ dependencies = [
  "colored",
  "dirs",
  "hex",
+ "libc",
  "predicates",
  "serde",
  "serde_json",

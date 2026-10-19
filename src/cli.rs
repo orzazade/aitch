@@ -4,6 +4,7 @@ use crate::hooks;
 use crate::providers;
 use crate::resolve;
 use crate::route;
+use crate::shim;
 use colored::Colorize;
 use std::env;
 use std::os::unix::process::CommandExt;
@@ -281,11 +282,31 @@ pub fn hook(shell: &str) -> Result<(), Box<dyn std::error::Error>> {
             .values()
             .any(|p| p.route.as_ref().is_some_and(|r| r.claude.is_some()))
     });
-    match shell {
-        "zsh" => print!("{}", hooks::zsh::generate(routed)),
-        "bash" => print!("{}", hooks::bash::generate(routed)),
+    let generate = match shell {
+        "zsh" => hooks::zsh::generate,
+        "bash" => hooks::bash::generate,
         _ => return Err(format!("unsupported shell: '{}' (use zsh or bash)", shell).into()),
-    }
+    };
+    let shim_dir = if routed {
+        match shim::install() {
+            Ok(dir) => Some(dir),
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "aitch: claude shim not installed, claude starts without its route: {}",
+                        e
+                    )
+                    .red()
+                    .bold()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    print!("{}", generate(shim_dir.as_deref()));
     // A hand-edited config reaches the hook in every new shell, so the hook and `aitch launch` read the same rules.
     cache::write_cache(&cfg?)?;
     Ok(())
@@ -297,7 +318,33 @@ pub fn launch(provider: &str, args: &[String]) -> Result<(), Box<dyn std::error:
     if provider != "claude" {
         return Err(format!("launch supports claude only, not '{}'", provider).into());
     }
-    let mut cmd = Command::new("claude");
+    start_claude(args)
+}
+
+/// Run as `claude` through the hook's shim. A start aitch already routed comes back here when a wrapper it started
+/// runs `claude` again; that goes on to the next claude as it is.
+pub fn claude_shim(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    match shim::tried()? {
+        Some(tried) => {
+            let mut cmd = shim::command(&tried)?;
+            let err = cmd.args(args).exec();
+            Err(cannot_run(&cmd, err))
+        }
+        None => start_claude(args),
+    }
+}
+
+fn cannot_run(cmd: &Command, err: std::io::Error) -> Box<dyn std::error::Error> {
+    format!(
+        "cannot run {}: {}",
+        cmd.get_program().to_string_lossy(),
+        err
+    )
+    .into()
+}
+
+fn start_claude(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = shim::command(&[])?;
     // A broken config must not stop claude: run it with the folder the hook's cache (last good config) set.
     let cfg = match config::load_config() {
         Ok(c) => c,
@@ -309,7 +356,7 @@ pub fn launch(provider: &str, args: &[String]) -> Result<(), Box<dyn std::error:
                     .bold()
             );
             let err = cmd.args(args).exec();
-            return Err(format!("cannot run claude: {}", err).into());
+            return Err(cannot_run(&cmd, err));
         }
     };
     let pwd = logical_pwd()?;
@@ -406,7 +453,7 @@ pub fn launch(provider: &str, args: &[String]) -> Result<(), Box<dyn std::error:
         }
     }
     let err = cmd.args(args).exec();
-    Err(format!("cannot run claude: {}", err).into())
+    Err(cannot_run(&cmd, err))
 }
 
 /// The directory as the shell sees it ($PWD, symlinks kept), like the hook's cache; else the physical one.

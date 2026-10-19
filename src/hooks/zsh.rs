@@ -1,8 +1,9 @@
 use crate::config;
+use std::path::Path;
 
-/// Generate the zsh hook that sources the cache on every directory change. With a route, `claude` goes through
-/// `aitch launch`, which picks the folder once per start.
-pub fn generate(routed: bool) -> String {
+/// Generate the zsh hook that sources the cache on every directory change. With a route, aitch's `claude` shim
+/// comes first on PATH and picks the folder once per start.
+pub fn generate(shim_dir: Option<&Path>) -> String {
     let cache = config::cache_path();
     let cache_str = cache.to_string_lossy();
 
@@ -24,11 +25,7 @@ _aitch_hook
 {}"#,
         cache_str,
         cache_str,
-        if routed {
-            "\n# A route picks the Claude Code folder at launch\nunalias claude 2>/dev/null || true\nfunction claude { command aitch launch claude -- \"$@\"; }\n"
-        } else {
-            ""
-        }
+        super::claude_shim(shim_dir)
     )
 }
 
@@ -38,7 +35,7 @@ mod tests {
 
     #[test]
     fn generates_valid_zsh_hook() {
-        let hook = generate(false);
+        let hook = generate(None);
         assert!(hook.contains("add-zsh-hook chpwd"));
         assert!(hook.contains("_aitch_hook"));
         assert!(hook.contains("source"));

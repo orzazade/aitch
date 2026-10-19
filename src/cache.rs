@@ -143,7 +143,7 @@ fn env_exports(profile: &crate::config::Profile) -> String {
 
 /// Escape a string for safe embedding in single-quoted shell context.
 /// Single quotes within the string are escaped as '\'' (end quote, escaped quote, start quote).
-fn shell_escape(s: &str) -> String {
+pub fn shell_escape(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 

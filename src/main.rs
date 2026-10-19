@@ -5,9 +5,12 @@ mod hooks;
 mod providers;
 mod resolve;
 mod route;
+mod shim;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(name = "aitch", version, about = "Universal AI account switcher")]
@@ -74,7 +77,7 @@ enum Commands {
         shell: String,
     },
 
-    /// Start a provider with the folder its route picks for this directory (the hook's `claude` calls this)
+    /// Start a provider with the folder its route picks for this directory (as `claude` through the hook's shim does)
     Launch {
         /// Provider to start: claude
         provider: String,
@@ -95,6 +98,23 @@ enum Commands {
 }
 
 fn main() {
+    // The hook's shim links `claude` to aitch: run that way, it is claude with the route applied.
+    let mut argv = std::env::args_os();
+    if argv
+        .next()
+        .as_deref()
+        .map(Path::new)
+        .and_then(Path::file_name)
+        == Some(OsStr::new("claude"))
+    {
+        let args: Result<Vec<String>, _> = argv.map(OsString::into_string).collect();
+        let result = match args {
+            Ok(args) => cli::claude_shim(&args),
+            Err(a) => Err(format!("argument is not UTF-8: {:?}", a).into()),
+        };
+        exit_on(result);
+    }
+
     let cli = Cli::parse();
 
     let result = match cli.command {
@@ -124,8 +144,12 @@ fn main() {
         Commands::Link { from, to } => cli::link(&from, &to),
     };
 
+    exit_on(result);
+}
+
+fn exit_on(result: Result<(), Box<dyn std::error::Error>>) {
     if let Err(e) = result {
         eprintln!("{}: {}", "error".red().bold(), e);
-        std::process::exit(1);
+        std::process::exit(if e.is::<shim::NoClaude>() { 127 } else { 1 });
     }
 }
