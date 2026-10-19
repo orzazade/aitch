@@ -1,81 +1,118 @@
 # aitch
 
-Universal AI account switcher. Auto-activate the right AI accounts per directory.
+Each project folder uses its own AI account. `cd` into a work repo and Claude Code runs on your work login;
+`cd` into a side project and it runs on your personal one, with nothing to type in between.
 
-Walk into any project directory. The right Claude, Codex, and Gemini accounts activate. No commands, no thinking.
+[![CI](https://github.com/orzazade/aitch/actions/workflows/ci.yml/badge.svg)](https://github.com/orzazade/aitch/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/orzazade/aitch)](https://github.com/orzazade/aitch/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+Claude Code keeps its login, settings, `CLAUDE.md` and MCP servers in one config folder, and it reads the
+folder's path from `CLAUDE_CONFIG_DIR`. With two accounts you have two folders. Without aitch, you set that
+variable by hand every time and sometimes forget:
+
+```bash
+cd ~/work/acme/api
+CLAUDE_CONFIG_DIR=~/.claude-work claude   # forget this once and the client's code goes through your personal account
+```
+
+aitch adds a shell hook. Every time you change folder, it sets the variable for that folder:
+
+```bash
+cd ~/work/acme/api && claude   # work account
+cd ~/code/blog && claude       # personal account
+```
+
+```mermaid
+flowchart LR
+    cd(["cd into a folder"]) --> A{"A .aitch file here<br/>or in a folder above?"}
+    A -- yes --> P["That profile"]
+    A -- no --> D{"Inside one of a<br/>profile's directories?"}
+    D -- yes --> P
+    D -- no --> G{"git origin matches<br/>a profile's pattern?"}
+    G -- yes --> P
+    G -- no --> F["The default profile"]
+    F --> P
+    P --> E["export CLAUDE_CONFIG_DIR<br/>(and the other providers' variables)"]
+```
+
+## Contents
+
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Config](#config)
+- [Commands](#commands)
+- [How a folder picks a profile](#how-a-folder-picks-a-profile)
+- [Share a profile through the repo](#share-a-profile-through-the-repo)
+- [Routing by quota (Claude Code)](#routing-by-quota-claude-code)
+- [FAQ and troubleshooting](#faq-and-troubleshooting)
+- [Contributing](#contributing)
 
 ## Install
 
+aitch runs on macOS and Linux, with zsh or bash. Git remote matching needs `git` on your `PATH`.
+
+### Release binary
+
+Builds for Apple silicon and Intel Macs and for x86_64 and arm64 Linux are on the
+[releases page](https://github.com/orzazade/aitch/releases/latest). Each archive holds one file, `aitch`:
+
 ```bash
-cargo install aitch
+# Pick your target: aarch64-apple-darwin, x86_64-apple-darwin,
+# x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu
+curl -L https://github.com/orzazade/aitch/releases/latest/download/aitch-aarch64-apple-darwin.tar.gz | tar xz
+mv aitch ~/.local/bin/   # or any folder on your PATH
 ```
 
-Or with Homebrew:
+### With cargo
+
+aitch is not on crates.io. A different crate already has the name there, so `cargo install aitch` installs the
+wrong program. Install from the repo:
 
 ```bash
-brew install orzazade/tap/aitch
+cargo install --git https://github.com/orzazade/aitch
 ```
 
-## Quick Start
+### From source
 
 ```bash
-# Initialize
+git clone https://github.com/orzazade/aitch
+cd aitch
+cargo build --release   # the binary is target/release/aitch
+```
+
+## Quick start
+
+Say your work repos live under `~/work/acme`, everything else is personal, and you have one Claude Code config
+folder for each account.
+
+```bash
 aitch init
+aitch add work --dir ~/work/acme --claude ~/.claude-work
+aitch add personal --dir ~/code --claude ~/.claude-personal
+aitch default personal                      # used in any folder no rule matches
 
-# Add profiles
-aitch add work --dir ~/Projects/work --claude ~/.claude-work
-aitch add personal --dir ~/Projects/personal --claude ~/.claude-personal
-
-# Set default fallback
-aitch default personal
-
-# Map git orgs (auto-detect for new repos)
-aitch add work --git "github.com/mycompany/*"
-
-# Add shell hook to ~/.zshrc
-echo 'eval "$(aitch hook zsh)"' >> ~/.zshrc
-
-# Verify
-cd ~/Projects/work/some-repo
-aitch which
-# Profile: work (directory match: ~/Projects/work)
-#   CLAUDE_CONFIG_DIR = ~/.claude-work
+echo 'eval "$(aitch hook zsh)"' >> ~/.zshrc  # bash: echo 'eval "$(aitch hook bash)"' >> ~/.bashrc
+exec zsh
 ```
 
-## How It Works
+Check what a folder gets:
 
-aitch uses a resolution chain to determine which profile to activate:
+```console
+$ cd ~/work/acme/api && aitch which
+Directory: /home/you/work/acme/api
+Profile: work (directory match: /home/you/work/acme)
 
-1. `.aitch` file — drop a file containing a profile name in any repo
-2. **Directory match** — prefix match against configured directories
-3. **Git remote** — match against git remote URL patterns. A pattern such as `github.com/org/*` (or
-   `github.com:org/*`) matches HTTPS and SSH (`git@github.com:org/repo`) clones alike
-4. **Default profile** — fallback when nothing else matches
+Providers:
+  CLAUDE_CONFIG_DIR = /home/you/.claude-work
+```
 
-A `.aitch` file that names a profile you don't have is skipped, and the walk goes on to the folders above it.
-
-The shell hook runs on every `cd` and sources a pre-compiled cache file. `aitch` commands rebuild it, and so does
-every new shell, so after editing `config.yaml` by hand, open a new shell. Static matches resolve in <1ms. Git remote detection (~3-5ms) only runs for unmatched directories.
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `aitch init` | Create ~/.aitch/ config directory |
-| `aitch add <profile>` | Add or update a profile |
-| `aitch default <profile>` | Set the default fallback profile |
-| `aitch list` | Show all profiles and mappings |
-| `aitch remove <profile>` | Remove a profile |
-| `aitch status` | Show active profile for current directory |
-| `aitch which` | Show which rule matched and why |
-| `aitch hook zsh` | Output zsh hook (for .zshrc) |
-| `aitch hook bash` | Output bash hook (for .bashrc) |
-| `aitch link <from> <to>` | Make `<to>` a Claude Code config dir that shares `<from>`'s rules by symlink |
-| `aitch launch claude -- <args>` | Start Claude Code with the dir a route picks (the hook's `claude` calls this) |
+The first time you run `claude` under each profile, use `/login` to sign in with that profile's account. After
+that, the folder decides which account you get.
 
 ## Config
 
-Config lives at `~/.aitch/config.yaml`:
+`aitch add` writes `~/.aitch/config.yaml`. You can also edit the file by hand; a new shell picks up the change.
 
 ```yaml
 default: personal
@@ -84,117 +121,219 @@ profiles:
   work:
     providers:
       claude: ~/.claude-work
-      codex: ~/.codex-work
     directories:
-      - ~/Projects/work
+      - ~/work/acme
     git_remotes:
-      - "github.com/mycompany/*"
+      - "github.com/acme/*"     # any clone of an acme repo, wherever it is on disk
 
   personal:
     providers:
       claude: ~/.claude-personal
     directories:
-      - ~/Projects/personal
-    git_remotes:
-      - "github.com/myusername/*"
+      - ~/code
 ```
+
+| Field | Meaning |
+|-------|---------|
+| `default` | The profile used where nothing else matches. |
+| `providers` | The config folder for each tool. An empty value (`codex: ""`) unsets that tool's variable. |
+| `directories` | The folders that belong to the profile, and everything inside them. |
+| `git_remotes` | Patterns matched against the repo's `origin` URL. `github.com/acme/*` matches HTTPS and SSH clones. |
+| `route` | Optional. Start Claude Code on a second account while it has quota; see [below](#routing-by-quota-claude-code). |
+
+Each provider sets one variable:
+
+| Key | Tool | Variable aitch exports |
+|-----|------|------------------------|
+| `claude` | Claude Code | `CLAUDE_CONFIG_DIR` |
+| `codex` | OpenAI Codex | `CODEX_CONFIG_DIR` |
+| `gemini` | Google Gemini CLI | `GEMINI_CONFIG_DIR` |
+
+> [!NOTE]
+> Only Claude Code switches today. Codex reads
+> [`CODEX_HOME`](https://developers.openai.com/codex/config-advanced) and Gemini CLI reads
+> [`GEMINI_CLI_HOME`](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md),
+> not the variables above, so the `codex` and `gemini` keys have no effect on those tools yet.
+
+## Commands
+
+| Command | What it does |
+|---------|--------------|
+| `aitch init` | Create `~/.aitch/config.yaml`. |
+| `aitch add <name> [--dir D] [--git PATTERN] [--claude D] [--codex D] [--gemini D]` | Create a profile or add to one. Run it again to add more folders or patterns. |
+| `aitch default <name>` | Set the profile for folders that match nothing. |
+| `aitch list` | Show every profile with its folders, patterns and variables. |
+| `aitch remove <name>` | Delete a profile. |
+| `aitch status` | Show the profile for the current folder. |
+| `aitch which` | Show the profile for the current folder and the rule that picked it. |
+| `aitch hook zsh` / `aitch hook bash` | Print the shell hook. Put it in `~/.zshrc` or `~/.bashrc` with `eval`. |
+| `aitch link <from> <to>` | Make `<to>` a Claude Code config folder that shares `<from>`'s rules by symlink. |
+| `aitch launch claude [-- args]` | Start Claude Code with the folder a route picks. The hook's `claude` function calls this. |
+
+Every command takes `--help`.
+
+## How a folder picks a profile
+
+aitch checks four rules in this order and uses the first that matches:
+
+1. A `.aitch` file in the folder or any folder above it, holding a profile name. A file that names a profile you
+   don't have is skipped, and the search goes on to the folders above.
+2. A directory match: the folder is one of a profile's `directories` or inside one. Matching ignores case and
+   stops at folder names, so `~/work/acme` does not match `~/work/acme-old`.
+3. A git remote match: the repo's `origin` URL contains the pattern. `github.com/acme/*` and
+   `github.com:acme/*` both match `https://github.com/acme/tool` and `git@github.com:acme/tool.git`.
+4. The default profile.
+
+`aitch which` tells you which rule won:
+
+```console
+$ cd ~/oss/tool && aitch which
+Directory: /home/you/oss/tool
+Profile: work (git remote: git@github.com:acme/tool.git matched github.com/acme/*)
+
+Providers:
+  CLAUDE_CONFIG_DIR = ~/.claude-work
+```
+
+aitch compiles the config into a small shell script, `~/.aitch/cache`, and the hook sources that script when the
+folder changes (zsh `chpwd`, bash `PROMPT_COMMAND`), so a `cd` doesn't run aitch itself. The script is rebuilt by
+`init`, `add`, `default` and `remove`, and by `aitch hook` in every new shell. On `cd` the hook only sets
+variables. With a [route](#routing-by-quota-claude-code) in the config, it also defines a `claude` function.
+
+## Share a profile through the repo
+
+Commit a `.aitch` file and everyone on the team who has a profile with that name gets it in this repo:
+
+```bash
+echo work > .aitch
+git add .aitch
+git commit -m "chore: add aitch profile"
+```
+
+Each person's `work` profile points at their own config folder, so the file holds no paths or accounts.
 
 ## Routing by quota (Claude Code)
 
-A profile can start Claude Code on a second account while that account has quota left, and on the profile's own
-account otherwise. The choice is made once, when `claude` starts; a running session is never switched.
+This is for people with two Claude accounts for the same work, for example a team seat and a personal plan. A
+profile can start Claude Code on the second account while that account has quota left, and on the profile's own
+account when it doesn't. aitch decides once, when `claude` starts. It never switches a session that is already
+running.
 
 ```yaml
 profiles:
   work:
     providers:
-      claude: ~/.claude-work         # the fallback dir
+      claude: ~/.claude-work         # the fallback folder: the profile's own account
     directories:
-      - ~/Projects/work
+      - ~/work/acme
     route:
       claude:
         primary: ~/.claude-alt       # used while the quota command says "room"
-        quota: ~/bin/my-quota --room # see the contract below
-        primary_org: <org id>        # optional: the login the primary dir must hold
-        fallback_org: <org id>       # optional: the login the fallback dir must hold
+        quota: ~/bin/my-quota        # any program that follows the contract below
+        primary_org: <org uuid>      # optional: the login the primary folder must hold
+        fallback_org: <org uuid>     # optional: the login the fallback folder must hold
 ```
 
-Set it up once:
+Set up the second folder once:
 
 ```bash
-aitch link ~/.claude-work ~/.claude-alt         # share the fallback dir's rules
+aitch link ~/.claude-work ~/.claude-alt         # share the fallback folder's rules
 CLAUDE_CONFIG_DIR=~/.claude-alt command claude  # then /login with the second account
 ```
 
-`aitch link` creates the primary dir with symlinks to the fallback dir's `CLAUDE.md`, `settings.json`, `agents`,
-`skills`, `commands`, `hooks`, `output-styles`, `plugins` and `projects` (each one that exists). The login
-(`.claude.json` and the keychain entry) stays separate. It never replaces a file that is not the right link. MCP
-servers live next to the login, so on each launch in the primary dir aitch passes the fallback dir's `mcpServers`
-with `--mcp-config` (a file under `~/.aitch/run/`, mode 0600, rewritten on each launch; it stays after the launch
-because aitch replaces itself with Claude Code, and it holds the same servers as the fallback dir's `.claude.json`), and sets
-`ENABLE_CLAUDEAI_MCP_SERVERS=false` so the second account's own claude.ai connectors stay out.
+`aitch link` creates the folder and symlinks each of these that exists in the fallback folder: `CLAUDE.md`,
+`settings.json`, `agents`, `skills`, `commands`, `hooks`, `output-styles`, `plugins` and `projects`. The login
+(`.claude.json` and the keychain entry) stays separate. It never replaces a file that isn't already the right link.
 
-Claude Code keeps per-folder trust in each dir's `.claude.json`. If the other dir of the route already trusts the launch
-folder or a folder above it, aitch marks the same folders as trusted in the dir it picked, so you are not asked again. It writes
-`.claude.json` only when that changes something, under the lock Claude Code uses for it. `claude mcp …` runs on the
-fallback dir (put `mcp` first, before any flag), since primary launches read their servers from there: user scope,
-and local scope for the launch folder's project (its git repo root, or a worktree's main repo, as Claude Code
-files it).
+With a route in the config, the hook also defines a `claude` shell function that calls `aitch launch claude`. Each
+launch prints one line to stderr with the folder it picked and why:
 
-With a route, the shell hook defines a `claude` function that calls `aitch launch claude`. It prints one line to
-stderr on every launch, saying which dir it picked and why:
-
-```
-aitch: work → primary (~/.claude-alt): 7d 43%, 5h 9%, sample 1 min old
+```text
+aitch: work → primary (~/.claude-alt): 7d 43%, 5h 9%
 aitch: work → fallback (~/.claude-work): quota full: 7d 100%
 aitch: work → fallback (~/.claude-work): QUOTA UNKNOWN: exit 4: no sample. Not using the primary dir.
 ```
 
-The fallback dir is used when the quota answer is anything but a clear "room": the command fails or is missing,
-takes longer than 3 seconds, or prints something unexpected. It is also used when a link in the primary dir was
-replaced or points elsewhere, or when the primary dir's login is not `primary_org`. If the fallback dir's login is
-not `fallback_org`, aitch does not start Claude Code at all. Anything that runs the `claude` binary directly gets
-the hook's plain `CLAUDE_CONFIG_DIR`, which is the fallback dir. If the config does not load, `claude` still starts with that
-plain value, after a red warning.
+aitch only uses the primary folder on a clear "room". It uses the fallback folder when the quota command fails, is
+missing, takes more than 3 seconds or prints something unexpected. It also falls back when a link in the primary
+folder was replaced, or the primary folder's login is not `primary_org`. If the fallback folder's login is not
+`fallback_org`, aitch refuses to start Claude Code. The org uuid is `oauthAccount.organizationUuid` in that folder's
+`.claude.json`.
+
+Claude Code keeps MCP servers next to the login, so the primary folder has none of its own. On a primary launch,
+aitch passes the fallback folder's servers (user scope, plus local scope for the launch folder's git repo) with
+`--mcp-config`, from a file in `~/.aitch/run/` with mode 0600. It also sets `ENABLE_CLAUDEAI_MCP_SERVERS=false`
+to keep the second account's claude.ai connectors out. Because primary launches read servers from the fallback
+folder, `claude mcp …` always runs there. Put `mcp` first, before any flag.
+
+Folder trust carries over too. If the other folder of the route already trusts the launch folder (or one above
+it), aitch marks it trusted in the folder it picked, so Claude Code doesn't ask again.
+
+Anything that runs the `claude` binary directly, not through the shell function, gets the fallback folder from
+`CLAUDE_CONFIG_DIR`.
 
 ### Quota command contract
 
-Any tool can be the quota command. aitch runs it without a shell (the string is split on spaces, `~` is expanded)
-and reads one JSON line from stdout:
+Any program can be the quota command. aitch runs it without a shell: it splits the string on spaces and expands
+`~` in the program path only, so give any file arguments as full paths. It reads one JSON line from stdout:
 
 ```json
-{"verdict": "room", "reason": "7d 43%, 5h 9%, sample 1 min old"}
+{"verdict": "room", "reason": "7d 43%, 5h 9%"}
 ```
 
-| Exit | `verdict` | aitch uses |
-|------|-----------|------------|
-| 0 | `room` | the primary dir |
-| 3 | `full` | the fallback dir |
-| 4 | `unknown` | the fallback dir, and says so loudly |
-| any other, or no valid JSON | — | the fallback dir, loudly (it shows the first stderr line) |
+| Exit code | `verdict` | aitch uses |
+|-----------|-----------|------------|
+| 0 | `room` | the primary folder |
+| 3 | `full` | the fallback folder |
+| 4 | `unknown` | the fallback folder, with a loud warning |
+| anything else, or no valid JSON | — | the fallback folder, with a loud warning and the first stderr line |
 
-`reason` is printed as is, so keep it to one short line. Other fields are ignored.
+aitch prints `reason` as is, so keep it to one short line. It ignores any other fields.
 
-## Supported Providers
+## FAQ and troubleshooting
 
-| Provider | Environment Variable |
-|----------|---------------------|
-| Claude Code | `CLAUDE_CONFIG_DIR` |
-| OpenAI Codex | `CODEX_CONFIG_DIR` |
-| Google Gemini | `GEMINI_CONFIG_DIR` |
+### `aitch which` is right but `echo $CLAUDE_CONFIG_DIR` is not
 
-## Team Usage
+The hook isn't loaded in this shell. Check that `eval "$(aitch hook zsh)"` (or `bash`) is in your rc file, then
+open a new shell.
 
-Drop a `.aitch` file in your repo root:
+### I edited `config.yaml` and nothing changed
+
+The hook reads a compiled copy. Open a new shell, or run any `aitch` command that saves the config (`add`,
+`default`, `remove`) to rebuild it.
+
+### I left a work folder and still have the work account
+
+In a folder that no rule matches, the hook leaves the variables as they were. Set a default profile with
+`aitch default <name>`.
+
+### A variable keeps its work value in personal folders
+
+The personal profile doesn't set that provider, so the old value stays. Give it a folder, or an empty value to
+unset it: `aitch add personal --codex ""`.
+
+### Two profiles list folders inside each other
+
+Directory matches are checked one profile at a time, in name order, and the first match wins, even when another
+profile has a longer path that fits. Put a `.aitch` file in the inner folder, since that rule is checked first.
+
+### Does it work with fish?
+
+No. `aitch hook` supports zsh and bash.
+
+## Contributing
+
+Issues and pull requests are welcome. Before you open a PR, run what CI runs:
 
 ```bash
-echo "work" > .aitch
-git add .aitch
-git commit -m "chore: add aitch profile"
+cargo test --all
+cargo clippy -- -D warnings
+cargo fmt -- --check
 ```
 
-Anyone with aitch installed and a "work" profile gets the right accounts automatically.
+The hook tests run the generated shell code in both bash and zsh, so you need both installed. Changes are listed
+in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT
+[MIT](LICENSE)
