@@ -130,7 +130,7 @@ fn env_exports(profile: &crate::config::Profile) -> String {
                 out.push_str(&format!("          unset {}\n", env_var));
                 continue;
             }
-            let expanded = expand_tilde(value);
+            let expanded = providers::env_value(key, &expand_tilde(value));
             out.push_str(&format!(
                 "          export {}='{}'\n",
                 env_var,
@@ -243,6 +243,22 @@ mod tests {
         // Verify case-insensitive matching: PWD is lowered before case match
         assert!(cache.contains("_pwd_lower"));
         assert!(cache.contains("tr '[:upper:]' '[:lower:]'"));
+    }
+
+    #[test]
+    fn gemini_exports_the_folder_that_holds_dot_gemini() {
+        let mut config = test_config();
+        let work = config.profiles.get_mut("work").unwrap();
+        work.providers
+            .insert("gemini".to_string(), "/tmp/g/work/.gemini/".to_string());
+        let personal = config.profiles.get_mut("personal").unwrap();
+        personal
+            .providers
+            .insert("gemini".to_string(), "/tmp/g/personal".to_string());
+        let cache = generate_cache(&config);
+        assert!(cache.contains("export GEMINI_CLI_HOME='/tmp/g/work'\n"));
+        assert!(cache.contains("export GEMINI_CLI_HOME='/tmp/g/personal'\n"));
+        assert!(!cache.contains("GEMINI_CONFIG_DIR"));
     }
 
     /// Source the generated cache in bash from `dir` with CLAUDE_CONFIG_DIR preset to "PRESET";

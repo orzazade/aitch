@@ -138,7 +138,11 @@ pub fn list() -> Result<(), Box<dyn std::error::Error>> {
             println!("  {}:", "providers".dimmed());
             for (key, path) in &profile.providers {
                 let env_var = providers::get_env_var(key).unwrap_or("?");
-                println!("    {} = {}", env_var.cyan(), path);
+                println!(
+                    "    {} = {}",
+                    env_var.cyan(),
+                    providers::env_value(key, path)
+                );
             }
         }
 
@@ -198,7 +202,7 @@ pub fn status() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(profile) = &result.profile {
                 for (key, path) in &profile.providers {
                     let env_var = providers::get_env_var(key).unwrap_or("?");
-                    println!("  {} = {}", env_var.cyan(), path);
+                    println!("  {} = {}", env_var.cyan(), providers::env_value(key, path));
                 }
             }
         }
@@ -261,7 +265,7 @@ pub fn which() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}:", "Providers".bold());
         for (key, path) in &profile.providers {
             let env_var = providers::get_env_var(key).unwrap_or("?");
-            println!("  {} = {}", env_var.cyan(), path);
+            println!("  {} = {}", env_var.cyan(), providers::env_value(key, path));
         }
     }
 

@@ -42,7 +42,7 @@ enum Commands {
         #[arg(long)]
         codex: Option<String>,
 
-        /// Google Gemini config directory for this profile
+        /// Gemini CLI home for this profile: the folder that holds .gemini
         #[arg(long)]
         gemini: Option<String>,
     },

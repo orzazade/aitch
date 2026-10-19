@@ -141,19 +141,13 @@ profiles:
 | `git_remotes` | Patterns matched against the repo's `origin` URL. `github.com/acme/*` matches HTTPS and SSH clones. |
 | `route` | Optional. Start Claude Code on a second account while it has quota; see [below](#routing-by-quota-claude-code). |
 
-Each provider sets one variable:
+Each provider sets one variable, the one the tool itself reads:
 
-| Key | Tool | Variable aitch exports |
-|-----|------|------------------------|
-| `claude` | Claude Code | `CLAUDE_CONFIG_DIR` |
-| `codex` | OpenAI Codex | `CODEX_CONFIG_DIR` |
-| `gemini` | Google Gemini CLI | `GEMINI_CONFIG_DIR` |
-
-> [!NOTE]
-> Only Claude Code switches today. Codex reads
-> [`CODEX_HOME`](https://developers.openai.com/codex/config-advanced) and Gemini CLI reads
-> [`GEMINI_CLI_HOME`](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md),
-> not the variables above, so the `codex` and `gemini` keys have no effect on those tools yet.
+| Key | Tool | Variable aitch exports | The folder you give it |
+|-----|------|------------------------|------------------------|
+| `claude` | Claude Code | `CLAUDE_CONFIG_DIR` | The config folder, like `~/.claude-work`. |
+| `codex` | OpenAI Codex | [`CODEX_HOME`](https://developers.openai.com/codex/config-advanced) | The Codex home, like `~/.codex-work`. |
+| `gemini` | Gemini CLI | [`GEMINI_CLI_HOME`](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md) | The folder Gemini CLI makes its `.gemini` folder in, like `~/gemini-work`. A path that ends in `.gemini` is exported as the folder above it. |
 
 ## Commands
 

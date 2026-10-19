@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The `codex` and `gemini` providers now switch those tools. aitch exported `CODEX_CONFIG_DIR` and
+  `GEMINI_CONFIG_DIR`, which neither tool reads; it now exports `CODEX_HOME` and `GEMINI_CLI_HOME`.
+- `GEMINI_CLI_HOME` names the folder that holds `.gemini`, so a `gemini:` value that ends in `.gemini` is exported as
+  the folder above it. `aitch list`, `status` and `which` show the value that is exported.
+
 ## 0.2.0 — 2026-10-17
 
 ### Added
