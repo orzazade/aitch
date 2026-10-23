@@ -8,7 +8,7 @@ use crate::shim;
 use colored::Colorize;
 use std::env;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Initialize aitch: create config directory and default config.
@@ -354,7 +354,7 @@ fn start_claude(primary: Option<&str>, args: &[String]) -> Result<(), Box<dyn st
         Ok(c) => c,
         Err(e) if primary.is_some() => {
             return Err(format!(
-                "--primary needs a route, and the config does not load: {}",
+                "--primary needs the config, and the config does not load: {}",
                 e
             )
             .into())
@@ -376,9 +376,6 @@ fn start_claude(primary: Option<&str>, args: &[String]) -> Result<(), Box<dyn st
         let r = p.route.as_ref()?.claude.as_ref()?;
         Some((r, p.providers.get("claude")?))
     });
-    if routed.is_none() && primary.is_some() {
-        return Err("--primary needs a route for this folder, and its profile has none".into());
-    }
     // The caller picked the account, so no org check; but the folder is its full path and has a login, or Claude
     // Code would read it from wherever it starts and ask to sign in there.
     let primary = primary.map(resolve::expand_tilde);
@@ -458,7 +455,12 @@ fn start_claude(primary: Option<&str>, args: &[String]) -> Result<(), Box<dyn st
         } else {
             &primary_dir
         };
-        match route::share_trust(Path::new(other), &choice.dir, &folders) {
+        match route::share_trust(
+            Path::new(other),
+            &choice.dir,
+            &folders,
+            &config::config_dir().join("backups"),
+        ) {
             Ok(marked) => {
                 for f in marked {
                     eprintln!(
@@ -474,6 +476,7 @@ fn start_claude(primary: Option<&str>, args: &[String]) -> Result<(), Box<dyn st
                 format!("aitch: folder trust not shared: {}", e).yellow()
             ),
         }
+        sync_linked(&choice.dir);
         cmd.env("CLAUDE_CONFIG_DIR", &choice.dir);
         if choice.primary {
             // One word: --mcp-config takes values up to the next flag and would eat the user's first arguments.
@@ -481,9 +484,108 @@ fn start_claude(primary: Option<&str>, args: &[String]) -> Result<(), Box<dyn st
             // The primary account's own claude.ai connectors are not part of the fallback dir's setup.
             cmd.env("ENABLE_CLAUDEAI_MCP_SERVERS", "false");
         }
+    } else if let Some(p) = &primary {
+        // No route: the caller names a folder of this profile's account family, its own or one linked to it.
+        let name = result.profile_name.as_deref().unwrap_or("?");
+        let value = result
+            .profile
+            .as_ref()
+            .and_then(|p| p.providers.get("claude"))
+            .ok_or("--primary needs a profile with a claude folder for this directory")?;
+        let unset = value.trim().is_empty();
+        let own = if unset {
+            route::default_dir()
+        } else {
+            PathBuf::from(resolve::expand_tilde(value))
+        };
+        let p = Path::new(p);
+        if !route::same_dir(p, &own) {
+            match route::source_of(p) {
+                Ok(Some(s)) if route::same_dir(&s, &own) => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "--primary {} is not {} or a folder linked to it (aitch link {} {})",
+                        p.display(),
+                        own.display(),
+                        own.display(),
+                        p.display()
+                    )
+                    .into())
+                }
+                Err(e) => return Err(format!("not launching claude: {}", e).into()),
+            }
+        }
+        let dir = if args.first().is_some_and(|a| a == "mcp") {
+            eprintln!(
+                "aitch: claude mcp runs on {}, whose servers {} takes",
+                own.display(),
+                p.display()
+            );
+            own.clone()
+        } else {
+            sync_linked(p);
+            p.to_path_buf()
+        };
+        eprintln!("aitch: {} → {} (named by --primary)", name, dir.display());
+        // As the hook starts it: Claude Code names a folder's login item after CLAUDE_CONFIG_DIR, so the default
+        // folder set by name would look for another login.
+        if unset && route::same_dir(&dir, &own) {
+            cmd.env_remove("CLAUDE_CONFIG_DIR");
+        } else {
+            cmd.env("CLAUDE_CONFIG_DIR", &dir);
+        }
+    } else if let Some(d) = env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+    {
+        // The folder the shell set: a linked one gets its source's servers and answers, and `claude mcp` edits them
+        // in the source, where they are kept.
+        match route::source_of(&d) {
+            Ok(Some(src)) if args.first().is_some_and(|a| a == "mcp") => {
+                eprintln!(
+                    "aitch: claude mcp runs on {}, whose servers {} takes",
+                    src.display(),
+                    d.display()
+                );
+                if route::same_dir(&src, &route::default_dir()) {
+                    cmd.env_remove("CLAUDE_CONFIG_DIR");
+                } else {
+                    cmd.env("CLAUDE_CONFIG_DIR", &src);
+                }
+            }
+            _ => sync_linked(&d),
+        }
     }
     let err = cmd.args(args).exec();
     Err(cannot_run(&cmd, err))
+}
+
+/// Bring linked folder `dir` in line with its source (route::sync_config) and say what changed. A failure is loud
+/// but does not stop the launch: Claude Code then asks its questions itself.
+fn sync_linked(dir: &Path) {
+    let fail = |e: String| {
+        eprintln!(
+            "{}",
+            format!("aitch: {} not synced: {}", dir.display(), e)
+                .red()
+                .bold()
+        )
+    };
+    let src = match route::source_of(dir) {
+        Ok(Some(s)) => s,
+        Ok(None) => return,
+        Err(e) => return fail(e),
+    };
+    match route::sync_config(&src, dir, &config::config_dir().join("backups")) {
+        Ok(s) if s == route::Synced::default() => {}
+        Ok(s) => eprintln!(
+            "aitch: {} synced from {}: {}",
+            dir.display(),
+            src.display(),
+            s.summary()
+        ),
+        Err(e) => fail(e),
+    }
 }
 
 /// The directory as the shell sees it ($PWD, symlinks kept), like the hook's cache; else the physical one.
@@ -504,6 +606,20 @@ pub fn link(from: &str, to: &str) -> Result<(), Box<dyn std::error::Error>> {
     let (from, to) = (resolve::expand_tilde(from), resolve::expand_tilde(to));
     let made = route::link(Path::new(&from), Path::new(&to))?;
     route::check_links(Path::new(&from), Path::new(&to))?;
+    let synced = route::sync_config(
+        Path::new(&from),
+        Path::new(&to),
+        &config::config_dir().join("backups"),
+    )
+    .map_err(|e| format!("linked, but not synced: {}", e))?;
+    if synced != route::Synced::default() {
+        println!(
+            "{} {} synced: {}",
+            "done:".green().bold(),
+            to,
+            synced.summary()
+        );
+    }
     if made.is_empty() {
         println!(
             "{} {} already links every rule from {}",
@@ -521,4 +637,21 @@ pub fn link(from: &str, to: &str) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     Ok(())
+}
+
+/// Report every config folder (see doctor::run); an error when it found a problem.
+pub fn doctor() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = config::load_config()?;
+    match crate::doctor::run(&cfg) {
+        0 => {
+            println!("{} no problems", "aitch doctor:".green().bold());
+            Ok(())
+        }
+        n => Err(format!(
+            "aitch doctor found {} problem{}",
+            n,
+            if n == 1 { "" } else { "s" }
+        )
+        .into()),
+    }
 }

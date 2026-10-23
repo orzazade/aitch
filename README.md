@@ -163,6 +163,7 @@ Each provider sets one variable, the one the tool itself reads:
 | `aitch hook zsh` / `aitch hook bash` | Print the shell hook. Put it in `~/.zshrc` or `~/.bashrc` with `eval`. |
 | `aitch link <from> <to>` | Make `<to>` a Claude Code config folder that shares `<from>`'s rules by symlink. |
 | `aitch launch claude [--primary <dir>] [-- args]` | Start Claude Code with the folder a route picks, as `claude` does after the hook. `--primary` names the primary folder for this launch. |
+| `aitch doctor` | Check every Claude Code config folder: login, MCP servers and answers shared from its source, MCP sign-ins. |
 
 Every command takes `--help`.
 
@@ -239,6 +240,24 @@ CLAUDE_CONFIG_DIR=~/.claude-alt command claude  # then /login with the second ac
 `settings.json`, `agents`, `skills`, `commands`, `hooks`, `output-styles`, `plugins` and `projects`. The login
 (`.claude.json` and the keychain entry) stays separate. It never replaces a file that isn't already the right link.
 
+### One config for every linked folder
+
+`.claude.json` holds the login, so it cannot be a link. aitch copies into each linked folder's `.claude.json` what
+the source folder sets for all of them, when you run `aitch link` and on every launch through aitch:
+
+- the MCP servers, user and local scope: the linked folder gets exactly the source's list;
+- each yes to a start-up question, per project: folder trust, CLAUDE.md imports from outside the folder, approved
+  `.mcp.json` servers. A no is never copied.
+
+Nothing else changes; the login fields are never touched. A missing `.claude.json` is created with mode 0600. Before
+each write the old file is saved in `~/.aitch/backups/` (mode 0600, the last 10 per folder). Each launch that
+changes something prints a line such as `aitch: ~/.claude-alt synced from ~/.claude-work: MCP servers +db`. `claude
+mcp …` on a linked folder runs on the source, where the servers are kept.
+
+MCP sign-ins (OAuth) are not copied: Claude Code keeps them in the folder's keychain item, next to its login. Sign
+in once per folder with `/mcp`. `aitch doctor` lists, per folder, the login, whether its servers and answers match
+the source, and each MCP server that still needs a sign-in. It exits 1 when it finds a problem and prints no token.
+
 With a route in the config, the hook links `~/.aitch/bin/claude` to aitch and puts `~/.aitch/bin` first on `PATH`,
 so `type claude` shows `~/.aitch/bin/claude`. When aitch runs as `claude`, it picks the folder and then starts the
 next `claude` on `PATH`. This also works in terminals that set up their own `claude` shell function, such as cmux:
@@ -267,8 +286,12 @@ With more than one second account, `aitch launch claude --primary <dir> -- <args
 folder for this one launch. Link it first (`aitch link <fallback> <dir>`) and sign in there. The links check, the
 quota command and the fallback rules stay the same; `primary_org` is not checked, since the caller picked the
 account, but `<dir>` must be a full path (or start with `~/`) and be signed in. The quota command must read
-`AITCH_PRIMARY`, or its answer is about some other account. A folder with no route, or a config that does not
-load, refuses `--primary`.
+`AITCH_PRIMARY`, or its answer is about some other account. A config that does not load refuses `--primary`.
+
+A profile with no route takes `--primary` too: `<dir>` must be the profile's own Claude folder or a folder linked
+to it, and signed in. aitch starts it with no quota command. The profile's own default folder (`claude: ''`) starts
+with `CLAUDE_CONFIG_DIR` unset, as the hook does: Claude Code names a folder's keychain login after that variable,
+so setting it to `~/.claude` would look for another login.
 
 Folder trust carries over too. If the other folder of the route already trusts the launch folder (or one above
 it), aitch marks it trusted in the folder it picked, so Claude Code doesn't ask again.

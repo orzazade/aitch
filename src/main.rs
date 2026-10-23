@@ -1,6 +1,7 @@
 mod cache;
 mod cli;
 mod config;
+mod doctor;
 mod hooks;
 mod providers;
 mod resolve;
@@ -91,6 +92,9 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Check every Claude Code config folder: login, MCP servers and answers shared from its source, MCP sign-ins
+    Doctor,
+
     /// Make <to> a config folder with its own login and the rules of <from> by symlink
     Link {
         /// The folder whose rules are shared (e.g. ~/.claude-work)
@@ -150,6 +154,7 @@ fn main() {
             args,
         } => cli::launch(&provider, primary.as_deref(), &args),
         Commands::Link { from, to } => cli::link(&from, &to),
+        Commands::Doctor => cli::doctor(),
     };
 
     exit_on(result);

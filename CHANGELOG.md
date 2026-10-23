@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **One config for every linked folder.** `aitch link` and every launch through aitch copy into a linked folder's
+  `.claude.json` the source's MCP servers (user and local scope, mirrored) and each yes to a start-up question (folder
+  trust, CLAUDE.md imports, approved `.mcp.json` servers). The login is never touched; the old file is backed up to
+  `~/.aitch/backups/` first. `claude mcp` on a linked folder runs on its source.
+- `aitch doctor` lists each config folder with its login, whether it matches its source, and which MCP servers still
+  need a sign-in there. It exits 1 on a problem and prints no token.
+- `--primary` works for a profile without a route: the folder must be the profile's own or linked to it.
+
+### Fixed
+
+- `--primary` naming the default folder `~/.claude` starts it with `CLAUDE_CONFIG_DIR` unset, as the hook does, so
+  Claude Code finds its login.
+
 ## 0.2.2 — 2026-10-20
 
 ### Fixed

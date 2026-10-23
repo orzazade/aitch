@@ -2,6 +2,7 @@
 //! says that account has room, and on the profile's own (fallback) dir otherwise. Unknown is never room.
 use crate::config::Route;
 use crate::resolve::expand_tilde;
+use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -9,9 +10,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// What the primary dir takes from the fallback dir by symlink: the rules, never the login.
 pub const LINKS: &[&str] = &[
@@ -137,8 +139,28 @@ fn reader<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<String> {
     rx
 }
 
+/// Claude Code's default config folder, the one it uses when CLAUDE_CONFIG_DIR is unset.
+pub fn default_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".claude")
+}
+
+/// Whether two paths name the same folder (both must exist).
+pub fn same_dir(a: &Path, b: &Path) -> bool {
+    matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
+}
+
+/// The file Claude Code keeps a folder's settings and login in: `.claude.json` inside it, but for the default folder
+/// `~/.claude.json`, beside it.
+pub fn config_file(dir: &Path) -> PathBuf {
+    if same_dir(dir, &default_dir()) {
+        dirs::home_dir().unwrap_or_default().join(".claude.json")
+    } else {
+        dir.join(".claude.json")
+    }
+}
+
 fn claude_json(dir: &Path) -> Result<serde_json::Value, String> {
-    let path = dir.join(".claude.json");
+    let path = config_file(dir);
     let text =
         fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     serde_json::from_str(&text).map_err(|e| format!("{} is not JSON: {e}", path.display()))
@@ -315,8 +337,13 @@ fn main_worktree(dir: &Path) -> PathBuf {
 /// Mark as trusted in `to` every folder that `from` trusts and that is one of `folders` or a parent of one, so the
 /// launch does not ask "trust this folder?" again. Writes `to/.claude.json` only when that changes something, keeps
 /// its other fields and its mode. Returns the folders it marked.
-pub fn share_trust(from: &Path, to: &Path, folders: &[String]) -> Result<Vec<String>, String> {
-    if let Err(e) = fs::symlink_metadata(from.join(".claude.json")) {
+pub fn share_trust(
+    from: &Path,
+    to: &Path,
+    folders: &[String],
+    backups: &Path,
+) -> Result<Vec<String>, String> {
+    if let Err(e) = fs::symlink_metadata(config_file(from)) {
         if e.kind() == std::io::ErrorKind::NotFound {
             return Ok(vec![]);
         }
@@ -337,19 +364,45 @@ pub fn share_trust(from: &Path, to: &Path, folders: &[String]) -> Result<Vec<Str
         .filter(|(k, v)| v["hasTrustDialogAccepted"] == true && covers(k))
         .map(|(k, _)| k)
         .collect();
-    let path = to.join(".claude.json");
-    let missing = |dst: &serde_json::Value| -> Vec<String> {
-        wanted
+    let what = to.join(".claude.json").display().to_string();
+    let marked = edit_claude_json(to, backups, &|dst| {
+        let todo: Vec<String> = wanted
             .iter()
-            .filter(|k| dst["projects"][k.as_str()]["hasTrustDialogAccepted"] != true)
+            .filter(|k| {
+                dst.get("projects")
+                    .and_then(|p| p.get(k.as_str()))
+                    .and_then(|p| p.get("hasTrustDialogAccepted"))
+                    != Some(&Json::Bool(true))
+            })
             .map(|k| k.to_string())
-            .collect()
-    };
-    if missing(&claude_json(to)?).is_empty() {
-        return Ok(vec![]);
-    }
-    // Claude Code changes this file under this lock, a folder; wait a little for it, never take it over.
-    let lock = to.join(".claude.json.lock");
+            .collect();
+        if todo.is_empty() {
+            return Ok(None);
+        }
+        let projects = object_in(dst, "projects", &what)?;
+        for k in &todo {
+            object_in(projects, k, &what)?.insert("hasTrustDialogAccepted".into(), true.into());
+        }
+        Ok(Some(todo))
+    })?;
+    Ok(marked.unwrap_or_default())
+}
+
+type Json = serde_json::Value;
+type Object = serde_json::Map<String, Json>;
+
+/// The object under `key` in `map`, added empty when missing; an error naming the file when it is something else.
+fn object_in<'a>(map: &'a mut Object, key: &str, file: &str) -> Result<&'a mut Object, String> {
+    map.entry(key.to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| format!("{key} in {file} is not an object"))
+}
+
+/// Take the lock Claude Code changes `dir/.claude.json` under (a folder); wait a little for it, never take it over.
+/// Returns the lock to remove when done.
+fn take_lock(dir: &Path) -> Result<PathBuf, String> {
+    let lock = dir.join(".claude.json.lock");
     let mut tries = 0;
     while let Err(e) = fs::create_dir(&lock) {
         tries += 1;
@@ -375,46 +428,76 @@ pub fn share_trust(from: &Path, to: &Path, folders: &[String]) -> Result<Vec<Str
         }
         thread::sleep(Duration::from_millis(20));
     }
-    let result = write_trust(&path, &missing);
+    Ok(lock)
+}
+
+/// Change `dir/.claude.json` through `edit`, which returns None when it changes nothing; then nothing is written. A
+/// write happens under Claude Code's lock: read the file again there, back it up into `backups`, and replace it
+/// atomically, same mode, only if nobody wrote it meanwhile, else try again. A missing file starts as `{}` and is
+/// created with mode 0600. Never writes through a symlink.
+fn edit_claude_json<R>(
+    dir: &Path,
+    backups: &Path,
+    edit: &dyn Fn(&mut Object) -> Result<Option<R>, String>,
+) -> Result<Option<R>, String> {
+    let path = dir.join(".claude.json");
+    // A look without the lock first: most launches change nothing and need not wait for it.
+    if edit(&mut read_current(&path)?.0)?.is_none() {
+        return Ok(None);
+    }
+    let lock = take_lock(dir)?;
+    let result = (|| {
+        for _ in 0..3 {
+            let (mut json, before) = read_current(&path)?;
+            let Some(r) = edit(&mut json)? else {
+                return Ok(None);
+            };
+            if replace(&path, &json, before.as_ref(), backups)? {
+                return Ok(Some(r));
+            }
+        }
+        Err(format!(
+            "{} kept changing while aitch wrote it; not written",
+            path.display()
+        ))
+    })();
     let _ = fs::remove_dir(&lock);
     result
 }
 
-/// Inside the lock: read `path` again, mark what is still missing, and replace it only if nobody wrote it meanwhile.
-fn write_trust(
-    path: &Path,
-    missing: &dyn Fn(&serde_json::Value) -> Vec<String>,
-) -> Result<Vec<String>, String> {
-    let meta = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+/// The file as an object, and its metadata and text as read (None: there is no file).
+type Current = (Object, Option<(fs::Metadata, String)>);
+
+fn read_current(path: &Path) -> Result<Current, String> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Object::new(), None)),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
     if meta.file_type().is_symlink() {
         return Err(format!(
             "{} is a symlink; not writing through it",
             path.display()
         ));
     }
-    let dir = path.parent().ok_or("no folder")?;
-    let mut dst = claude_json(dir)?;
-    let todo = missing(&dst);
-    if todo.is_empty() {
-        return Ok(todo);
+    let text =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    match serde_json::from_str(&text) {
+        Ok(Json::Object(m)) => Ok((m, Some((meta, text)))),
+        Ok(_) => Err(format!("{} is not a JSON object", path.display())),
+        Err(e) => Err(format!("{} is not JSON: {e}", path.display())),
     }
-    let bad = || format!("projects in {} is not an object", path.display());
-    let projects = dst
-        .as_object_mut()
-        .ok_or_else(bad)?
-        .entry("projects")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .ok_or_else(bad)?;
-    for k in &todo {
-        projects
-            .entry(k.clone())
-            .or_insert_with(|| serde_json::json!({}))
-            .as_object_mut()
-            .ok_or_else(bad)?
-            .insert("hasTrustDialogAccepted".into(), true.into());
-    }
-    let body = serde_json::to_string_pretty(&dst).map_err(|e| e.to_string())?;
+}
+
+/// Replace `path` with `json` if it is still as `before` found it (None: still missing), backing up the old text
+/// first. False when it changed meanwhile: another writer that skipped the lock keeps its version.
+fn replace(
+    path: &Path,
+    json: &Object,
+    before: Option<&(fs::Metadata, String)>,
+    backups: &Path,
+) -> Result<bool, String> {
+    let body = serde_json::to_string_pretty(json).map_err(|e| e.to_string())?;
     let tmp = path.with_extension(format!("json.aitch{}", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let write = || -> std::io::Result<bool> {
@@ -423,32 +506,293 @@ fn write_trust(
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
-        f.set_permissions(meta.permissions())?;
+        if let Some((meta, _)) = before {
+            f.set_permissions(meta.permissions())?;
+        }
         f.write_all(body.as_bytes())?;
         f.sync_all()?;
-        // Another writer that skipped the lock: keep its version.
-        let now = fs::metadata(path)?;
-        if now.modified()? != meta.modified()? || now.len() != meta.len() || now.ino() != meta.ino()
-        {
+        let same = match (before, fs::symlink_metadata(path)) {
+            (None, Err(e)) => e.kind() == std::io::ErrorKind::NotFound,
+            (Some((meta, _)), Ok(now)) => {
+                now.modified()? == meta.modified()?
+                    && now.len() == meta.len()
+                    && now.ino() == meta.ino()
+            }
+            _ => false,
+        };
+        if !same {
             return Ok(false);
+        }
+        if let Some((_, text)) = before {
+            backup(backups, path, text)?;
         }
         fs::rename(&tmp, path)?;
         Ok(true)
     };
-    match write() {
-        Ok(true) => Ok(todo),
-        Ok(false) => {
-            let _ = fs::remove_file(&tmp);
-            Err(format!(
-                "{} changed while writing; trust not shared",
-                path.display()
-            ))
+    let result = write();
+    if !matches!(result, Ok(true)) {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// How many backups of one folder's `.claude.json` are kept.
+const BACKUPS_KEPT: usize = 10;
+
+/// Save `text`, the content of `path` before a write, into `backups` (mode 0600); keep the newest BACKUPS_KEPT of
+/// that file.
+fn backup(backups: &Path, path: &Path, text: &str) -> std::io::Result<()> {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    fs::create_dir_all(backups)?;
+    let folder = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().trim_start_matches('.').to_string())
+        .unwrap_or_default();
+    let id = hex::encode(Sha256::digest(path.as_os_str().as_bytes()));
+    let tag = format!("{folder}-{}.claude.json.", &id[..8]);
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let name = format!(
+        "{tag}{ms:013}-{}-{:04}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(backups.join(name))?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    let mut old: Vec<PathBuf> = fs::read_dir(backups)?
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&tag))
+        .map(|e| e.path())
+        .collect();
+    old.sort();
+    for p in old.iter().rev().skip(BACKUPS_KEPT) {
+        let _ = fs::remove_file(p);
+    }
+    Ok(())
+}
+
+/// What `sync_config` changed: MCP server names (`+` added, `~` changed, `-` removed; a local one with its project)
+/// and how many answers it copied.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Synced {
+    pub servers: Vec<String>,
+    pub answers: usize,
+}
+
+impl Synced {
+    /// One line: "MCP servers +a -b, 2 answers".
+    pub fn summary(&self) -> String {
+        let mut parts = vec![];
+        if !self.servers.is_empty() {
+            parts.push(format!("MCP servers {}", self.servers.join(" ")));
         }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(format!("cannot write {}: {e}", path.display()))
+        if self.answers > 0 {
+            let s = if self.answers == 1 { "" } else { "s" };
+            parts.push(format!("{} answer{s}", self.answers));
+        }
+        parts.join(", ")
+    }
+}
+
+/// The per-project answers to Claude Code's start-up questions a linked folder takes from its source: folder trust
+/// and CLAUDE.md imports from outside the folder. Only a yes is copied, never a no.
+const ANSWERS: &[&str] = &[
+    "hasTrustDialogAccepted",
+    "hasClaudeMdExternalIncludesApproved",
+    "hasClaudeMdExternalIncludesWarningShown",
+];
+
+/// Per-project lists of approved project (`.mcp.json`) servers: the source's names are added, none removed.
+const APPROVALS: &[&str] = &["enabledMcpjsonServers"];
+
+/// The folder whose rules `dir` links to (see `link`): None when it links into no config folder (a source itself),
+/// an error when its links point into more than one or miss one. A config folder is one with a `.claude.json`, so a
+/// source whose CLAUDE.md is a link into a dotfiles repo is still a source.
+pub fn source_of(dir: &Path) -> Result<Option<PathBuf>, String> {
+    let mut found: Option<PathBuf> = None;
+    for name in LINKS {
+        let at = dir.join(name);
+        let Ok(target) = fs::read_link(&at) else {
+            continue;
+        };
+        let Some(folder) = dir
+            .join(target)
+            .parent()
+            .and_then(|p| fs::canonicalize(p).ok())
+        else {
+            continue;
+        };
+        if !config_file(&folder).exists() {
+            continue;
+        }
+        match &found {
+            Some(f) if *f != folder => {
+                return Err(format!(
+                    "{} links into more than one folder ({} and {})",
+                    dir.display(),
+                    f.display(),
+                    folder.display()
+                ))
+            }
+            _ => found = Some(folder),
         }
     }
+    let Some(src) = found else {
+        return Ok(None);
+    };
+    check_links(&src, dir)?;
+    Ok(Some(src))
+}
+
+/// Make `map[key]` the servers `want` names (an object, or null for none); report each name that changes.
+fn mirror(
+    map: &mut Object,
+    key: &str,
+    want: &Json,
+    scope: &str,
+    file: &str,
+    report: &mut Vec<String>,
+) -> Result<(), String> {
+    let empty = Object::new();
+    let objects = |v: Option<&Json>, at: &str| match v {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::Object(m)) => Ok(Some(m.clone())),
+        Some(_) => Err(format!("{key}{scope} in {at} is not an object")),
+    };
+    let want = objects(Some(want), "the source")?;
+    let have = objects(map.get(key), file)?;
+    let (w, h) = (
+        want.as_ref().unwrap_or(&empty),
+        have.as_ref().unwrap_or(&empty),
+    );
+    let before = report.len();
+    for (name, v) in w {
+        match h.get(name) {
+            None => report.push(format!("+{name}{scope}")),
+            Some(old) if old != v => report.push(format!("~{name}{scope}")),
+            _ => {}
+        }
+    }
+    for name in h.keys().filter(|n| !w.contains_key(*n)) {
+        report.push(format!("-{name}{scope}"));
+    }
+    if report.len() > before {
+        match want {
+            Some(m) => map.insert(key.to_string(), Json::Object(m)),
+            None => map.remove(key),
+        };
+    }
+    Ok(())
+}
+
+/// Make `to/.claude.json` carry what `from/.claude.json` sets for every folder linked to it: the same MCP servers (user
+/// and local scope, mirrored) and every yes to a start-up question (ANSWERS, APPROVALS). Never touches anything else,
+/// the login included. Creates the file (mode 0600) when it is missing; backs it up into `backups` before every write.
+pub fn sync_config(from: &Path, to: &Path, backups: &Path) -> Result<Synced, String> {
+    sync(from, to, Some(backups))
+}
+
+/// What `sync_config` would change now, writing nothing.
+pub fn sync_preview(from: &Path, to: &Path) -> Result<Synced, String> {
+    sync(from, to, None)
+}
+
+fn sync(from: &Path, to: &Path, backups: Option<&Path>) -> Result<Synced, String> {
+    let src = claude_json(from)?;
+    let file = to.join(".claude.json").display().to_string();
+    let none = Object::new();
+    let src_projects = match &src["projects"] {
+        Json::Null => &none,
+        Json::Object(m) => m,
+        _ => {
+            return Err(format!(
+                "projects in {}/.claude.json is not an object",
+                from.display()
+            ))
+        }
+    };
+    let edit = |dst: &mut Object| {
+        let mut out = Synced::default();
+        mirror(
+            dst,
+            "mcpServers",
+            &src["mcpServers"],
+            "",
+            &file,
+            &mut out.servers,
+        )?;
+        let dst_projects = object_in(dst, "projects", &file)?;
+        let mut keys: Vec<String> = src_projects.keys().cloned().collect();
+        keys.extend(
+            dst_projects
+                .keys()
+                .filter(|k| !src_projects.contains_key(*k))
+                .cloned(),
+        );
+        for k in keys {
+            let sp = src_projects.get(&k).unwrap_or(&Json::Null);
+            let dp = dst_projects.get(&k).unwrap_or(&Json::Null);
+            let local = |v: &Json| v["mcpServers"].as_object().is_some_and(|m| !m.is_empty());
+            let yes: Vec<&str> = ANSWERS
+                .iter()
+                .copied()
+                .filter(|a| sp[*a] == true && dp[*a] != true)
+                .collect();
+            let approve: Vec<(&str, Vec<Json>)> = APPROVALS
+                .iter()
+                .filter_map(|a| {
+                    let have = dp[*a].as_array();
+                    let new: Vec<Json> = sp[*a]
+                        .as_array()?
+                        .iter()
+                        .filter(|n| !have.is_some_and(|h| h.contains(n)))
+                        .cloned()
+                        .collect();
+                    (!new.is_empty()).then_some((*a, new))
+                })
+                .collect();
+            if !local(sp) && !local(dp) && yes.is_empty() && approve.is_empty() {
+                continue;
+            }
+            let scope = format!(" ({k})");
+            let dp = object_in(dst_projects, &k, &file)?;
+            mirror(
+                dp,
+                "mcpServers",
+                &sp["mcpServers"],
+                &scope,
+                &file,
+                &mut out.servers,
+            )?;
+            for a in yes {
+                dp.insert(a.to_string(), true.into());
+                out.answers += 1;
+            }
+            for (a, new) in approve {
+                out.answers += new.len();
+                let list = dp
+                    .entry(a.to_string())
+                    .or_insert_with(|| serde_json::json!([]));
+                list.as_array_mut()
+                    .ok_or_else(|| format!("{a}{scope} in {file} is not a list"))?
+                    .extend(new);
+            }
+        }
+        Ok((out != Synced::default()).then_some(out))
+    };
+    let done = match backups {
+        Some(b) => edit_claude_json(to, b, &edit)?,
+        None => edit(&mut read_current(&to.join(".claude.json"))?.0)?,
+    };
+    Ok(done.unwrap_or_default())
 }
 
 /// Pick the folder for one launch. Guards first (logins, links, MCP), then the quota verdict.
@@ -1016,7 +1360,13 @@ mod tests {
         write_json(&to, t);
         fs::set_permissions(&to, fs::Permissions::from_mode(0o666)).unwrap();
 
-        let mut got = share_trust(&s.fallback, &s.primary, &["/r/svc/deep".to_string()]).unwrap();
+        let mut got = share_trust(
+            &s.fallback,
+            &s.primary,
+            &["/r/svc/deep".to_string()],
+            &s.root.join("backups"),
+        )
+        .unwrap();
         got.sort();
         assert_eq!(got, ["/r", "/r/svc"]);
         let t = read_json(&to);
@@ -1041,11 +1391,14 @@ mod tests {
         );
 
         let before = fs::read_to_string(&to).unwrap();
-        assert!(
-            share_trust(&s.fallback, &s.primary, &["/r/svc/deep".to_string()])
-                .unwrap()
-                .is_empty()
-        );
+        assert!(share_trust(
+            &s.fallback,
+            &s.primary,
+            &["/r/svc/deep".to_string()],
+            &s.root.join("backups")
+        )
+        .unwrap()
+        .is_empty());
         assert_eq!(
             fs::read_to_string(&to).unwrap(),
             before,
@@ -1063,7 +1416,13 @@ mod tests {
         let real = s.root.join("real.json");
         fs::rename(s.primary.join(".claude.json"), &real).unwrap();
         symlink(&real, s.primary.join(".claude.json")).unwrap();
-        assert!(share_trust(&s.fallback, &s.primary, &["/r".to_string()]).is_err());
+        assert!(share_trust(
+            &s.fallback,
+            &s.primary,
+            &["/r".to_string()],
+            &s.root.join("backups")
+        )
+        .is_err());
         assert!(fs::symlink_metadata(s.primary.join(".claude.json"))
             .unwrap()
             .file_type()
@@ -1102,7 +1461,13 @@ mod tests {
         let lock = s.primary.join(".claude.json.lock");
         fs::create_dir(&lock).unwrap();
         let before = fs::read_to_string(s.primary.join(".claude.json")).unwrap();
-        let err = share_trust(&s.fallback, &s.primary, &["/r".to_string()]).unwrap_err();
+        let err = share_trust(
+            &s.fallback,
+            &s.primary,
+            &["/r".to_string()],
+            &s.root.join("backups"),
+        )
+        .unwrap_err();
         assert!(err.contains("lock"), "{err}");
         assert_eq!(
             fs::read_to_string(s.primary.join(".claude.json")).unwrap(),
@@ -1115,9 +1480,14 @@ mod tests {
     fn trust_from_a_dir_without_a_login_file_shares_nothing() {
         let s = setup();
         fs::remove_file(s.fallback.join(".claude.json")).unwrap();
-        assert!(share_trust(&s.fallback, &s.primary, &["/r".to_string()])
-            .unwrap()
-            .is_empty());
+        assert!(share_trust(
+            &s.fallback,
+            &s.primary,
+            &["/r".to_string()],
+            &s.root.join("backups")
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
@@ -1147,7 +1517,13 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        let err = share_trust(&s.fallback, &s.primary, &["/r".to_string()]).unwrap_err();
+        let err = share_trust(
+            &s.fallback,
+            &s.primary,
+            &["/r".to_string()],
+            &s.root.join("backups"),
+        )
+        .unwrap_err();
         assert!(err.contains("stale") && err.contains("remove"), "{err}");
         assert!(lock.is_dir());
     }
@@ -1207,7 +1583,13 @@ mod tests {
             r#"{"zeta": 1, "alpha": {"y": 1, "b": 2}, "projects": {}}"#,
         )
         .unwrap();
-        share_trust(&s.fallback, &s.primary, &["/r".to_string()]).unwrap();
+        share_trust(
+            &s.fallback,
+            &s.primary,
+            &["/r".to_string()],
+            &s.root.join("backups"),
+        )
+        .unwrap();
         let body = fs::read_to_string(&to).unwrap();
         let at = |k: &str| body.find(k).unwrap();
         assert!(
@@ -1216,11 +1598,282 @@ mod tests {
         );
     }
 
+    fn mode(p: &Path) -> u32 {
+        fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    fn backups_of(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .map(|r| {
+                r.map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn source_of_a_linked_folder_is_the_folder_it_links_to() {
+        let s = setup();
+        let fallback = fs::canonicalize(&s.fallback).unwrap();
+        assert_eq!(source_of(&s.primary).unwrap(), Some(fallback));
+        assert_eq!(
+            source_of(&s.fallback).unwrap(),
+            None,
+            "a source links nothing"
+        );
+        // Links into two folders, or one missing, are not a linked folder: say so, do not guess.
+        let other = s.root.join("other");
+        login(&other, "org-other");
+        fs::write(other.join("CLAUDE.md"), "x").unwrap();
+        fs::remove_file(s.primary.join("CLAUDE.md")).unwrap();
+        symlink(other.join("CLAUDE.md"), s.primary.join("CLAUDE.md")).unwrap();
+        let err = source_of(&s.primary).unwrap_err();
+        assert!(err.contains("more than one folder"), "{err}");
+        fs::remove_file(s.primary.join("CLAUDE.md")).unwrap();
+        let err = source_of(&s.primary).unwrap_err();
+        assert!(err.contains("CLAUDE.md"), "{err}");
+    }
+
+    #[test]
+    fn a_source_with_a_link_into_a_dotfiles_folder_is_still_a_source() {
+        let s = setup();
+        let dots = s.root.join("dotfiles");
+        fs::create_dir_all(&dots).unwrap();
+        fs::write(dots.join("CLAUDE.md"), "mine").unwrap();
+        fs::remove_file(s.fallback.join("CLAUDE.md")).unwrap();
+        symlink(dots.join("CLAUDE.md"), s.fallback.join("CLAUDE.md")).unwrap();
+        assert_eq!(source_of(&s.fallback).unwrap(), None);
+    }
+
+    #[test]
+    fn sync_mirrors_the_user_servers_and_keeps_the_login() {
+        let s = setup();
+        let backups = s.root.join("backups");
+        write_json(
+            &s.fallback.join(".claude.json"),
+            serde_json::json!({"oauthAccount": {"organizationUuid": FALLBACK_ORG},
+                "mcpServers": {"github": {"command": "gh-mcp", "args": ["new"]},
+                               "cortex": {"type": "http", "url": "https://c/mcp"}}}),
+        );
+        write_json(
+            &s.primary.join(".claude.json"),
+            serde_json::json!({"oauthAccount": {"organizationUuid": PRIMARY_ORG, "emailAddress": "p@x"},
+                "mcpServers": {"github": {"command": "gh-mcp"}, "old": {"command": "o"}},
+                "numStartups": 7}),
+        );
+        let mut got = sync_config(&s.fallback, &s.primary, &backups).unwrap();
+        got.servers.sort();
+        assert_eq!(got.servers, ["+cortex", "-old", "~github"]);
+        let t = read_json(&s.primary.join(".claude.json"));
+        assert_eq!(
+            t["mcpServers"],
+            read_json(&s.fallback.join(".claude.json"))["mcpServers"]
+        );
+        assert_eq!(
+            t["oauthAccount"]["organizationUuid"], PRIMARY_ORG,
+            "login kept"
+        );
+        assert_eq!(t["oauthAccount"]["emailAddress"], "p@x");
+        assert_eq!(t["numStartups"], 7, "other keys kept");
+    }
+
+    #[test]
+    fn sync_copies_every_yes_and_never_a_no() {
+        let s = setup();
+        let backups = s.root.join("backups");
+        write_json(
+            &s.fallback.join(".claude.json"),
+            serde_json::json!({"projects": {
+                "/a": {"hasTrustDialogAccepted": true, "hasClaudeMdExternalIncludesApproved": true,
+                       "hasClaudeMdExternalIncludesWarningShown": true, "enabledMcpjsonServers": ["x", "y"],
+                       "lastCost": 5, "allowedTools": ["Bash"]},
+                "/b": {"hasTrustDialogAccepted": false}}}),
+        );
+        write_json(
+            &s.primary.join(".claude.json"),
+            serde_json::json!({"oauthAccount": {"organizationUuid": PRIMARY_ORG}, "projects": {
+                "/a": {"enabledMcpjsonServers": ["y", "z"]},
+                "/b": {"hasTrustDialogAccepted": true}}}),
+        );
+        let got = sync_config(&s.fallback, &s.primary, &backups).unwrap();
+        assert_eq!(got.answers, 4, "{got:?}");
+        let t = read_json(&s.primary.join(".claude.json"));
+        let a = &t["projects"]["/a"];
+        assert_eq!(a["hasTrustDialogAccepted"], true);
+        assert_eq!(a["hasClaudeMdExternalIncludesApproved"], true);
+        assert_eq!(a["hasClaudeMdExternalIncludesWarningShown"], true);
+        assert_eq!(
+            a["enabledMcpjsonServers"],
+            serde_json::json!(["y", "z", "x"])
+        );
+        assert!(
+            a.get("lastCost").is_none() && a.get("allowedTools").is_none(),
+            "only answers: {a}"
+        );
+        assert_eq!(
+            t["projects"]["/b"]["hasTrustDialogAccepted"], true,
+            "a yes here is kept"
+        );
+    }
+
+    #[test]
+    fn sync_mirrors_the_local_servers_of_every_project() {
+        let s = setup();
+        let backups = s.root.join("backups");
+        write_json(
+            &s.fallback.join(".claude.json"),
+            serde_json::json!({"mcpServers": {}, "projects": {"/repo": {"mcpServers": {"db": {"command": "db"}}}}}),
+        );
+        write_json(
+            &s.primary.join(".claude.json"),
+            serde_json::json!({"projects": {"/old": {"mcpServers": {"gone": {"command": "g"}}, "lastCost": 1}}}),
+        );
+        let mut got = sync_config(&s.fallback, &s.primary, &backups).unwrap();
+        got.servers.sort();
+        assert_eq!(got.servers, ["+db (/repo)", "-gone (/old)"]);
+        let t = read_json(&s.primary.join(".claude.json"));
+        assert_eq!(t["projects"]["/repo"]["mcpServers"]["db"]["command"], "db");
+        assert!(t["projects"]["/old"].get("mcpServers").is_none());
+        assert_eq!(t["projects"]["/old"]["lastCost"], 1);
+    }
+
+    #[test]
+    fn sync_keeps_the_mode_and_the_order_and_backs_up_before_writing() {
+        let s = setup();
+        let backups = s.root.join("backups");
+        let to = s.primary.join(".claude.json");
+        fs::write(&to, r#"{"zeta": 1, "alpha": {"y": 1, "b": 2}}"#).unwrap();
+        fs::set_permissions(&to, fs::Permissions::from_mode(0o644)).unwrap();
+        sync_config(&s.fallback, &s.primary, &backups).unwrap();
+        let body = fs::read_to_string(&to).unwrap();
+        let at = |k: &str| body.find(k).unwrap();
+        assert!(
+            at("zeta") < at("alpha") && at("\"y\"") < at("\"b\""),
+            "{body}"
+        );
+        assert_eq!(mode(&to), 0o644);
+        let b = backups_of(&backups);
+        assert_eq!(b.len(), 1, "{b:?}");
+        let saved = backups.join(&b[0]);
+        assert_eq!(
+            fs::read_to_string(&saved).unwrap(),
+            r#"{"zeta": 1, "alpha": {"y": 1, "b": 2}}"#
+        );
+        assert_eq!(mode(&saved), 0o600);
+        // Nothing to change: no write, no backup.
+        let before = fs::metadata(&to).unwrap();
+        assert_eq!(
+            sync_config(&s.fallback, &s.primary, &backups).unwrap(),
+            Synced::default()
+        );
+        assert_eq!(
+            fs::metadata(&to).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        assert_eq!(backups_of(&backups).len(), 1);
+    }
+
+    #[test]
+    fn sync_keeps_the_last_ten_backups_of_a_folder() {
+        let s = setup();
+        let backups = s.root.join("backups");
+        for i in 0..12 {
+            write_json(
+                &s.fallback.join(".claude.json"),
+                serde_json::json!({"mcpServers": {"s": {"command": format!("c{i}")}}}),
+            );
+            sync_config(&s.fallback, &s.primary, &backups).unwrap();
+        }
+        assert_eq!(backups_of(&backups).len(), 10);
+    }
+
+    #[test]
+    fn sync_creates_a_missing_file_private_and_without_a_login() {
+        let s = setup();
+        let backups = s.root.join("backups");
+        let to = s.root.join("fresh");
+        link(&s.fallback, &to).unwrap();
+        let _ = fs::remove_file(to.join(".claude.json"));
+        write_json(
+            &s.fallback.join(".claude.json"),
+            serde_json::json!({"oauthAccount": {"organizationUuid": FALLBACK_ORG},
+                "mcpServers": {"cortex": {"type": "http", "url": "https://c/mcp"}},
+                "projects": {"/r": {"hasTrustDialogAccepted": true}}}),
+        );
+        let got = sync_config(&s.fallback, &to, &backups).unwrap();
+        assert_eq!(got.servers, ["+cortex"]);
+        let t = read_json(&to.join(".claude.json"));
+        assert!(t.get("oauthAccount").is_none(), "no login copied: {t}");
+        assert_eq!(t["projects"]["/r"]["hasTrustDialogAccepted"], true);
+        assert_eq!(mode(&to.join(".claude.json")), 0o600);
+        assert!(backups_of(&backups).is_empty(), "nothing to back up");
+    }
+
+    #[test]
+    fn sync_never_writes_through_a_symlink_or_past_a_held_lock() {
+        let s = setup();
+        let backups = s.root.join("backups");
+        write_json(
+            &s.fallback.join(".claude.json"),
+            serde_json::json!({"mcpServers": {"new": {"command": "n"}}}),
+        );
+        let lock = s.primary.join(".claude.json.lock");
+        fs::create_dir(&lock).unwrap();
+        let before = fs::read_to_string(s.primary.join(".claude.json")).unwrap();
+        let err = sync_config(&s.fallback, &s.primary, &backups).unwrap_err();
+        assert!(err.contains("lock"), "{err}");
+        assert_eq!(
+            fs::read_to_string(s.primary.join(".claude.json")).unwrap(),
+            before
+        );
+        assert!(lock.is_dir());
+        fs::remove_dir(&lock).unwrap();
+        let real = s.root.join("real.json");
+        fs::rename(s.primary.join(".claude.json"), &real).unwrap();
+        symlink(&real, s.primary.join(".claude.json")).unwrap();
+        let err = sync_config(&s.fallback, &s.primary, &backups).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(fs::read_to_string(&real).unwrap(), before);
+    }
+
+    #[test]
+    fn sync_from_a_source_without_a_file_is_an_error_not_an_empty_mirror() {
+        let s = setup();
+        fs::remove_file(s.fallback.join(".claude.json")).unwrap();
+        let before = fs::read_to_string(s.primary.join(".claude.json")).unwrap();
+        let err = sync_config(&s.fallback, &s.primary, &s.root.join("b")).unwrap_err();
+        assert!(err.contains(".claude.json"), "{err}");
+        assert_eq!(
+            fs::read_to_string(s.primary.join(".claude.json")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn sharing_trust_backs_up_too() {
+        let s = setup();
+        let backups = s.root.join("backups");
+        let from = s.fallback.join(".claude.json");
+        let mut f = read_json(&from);
+        f["projects"] = serde_json::json!({"/r": {"hasTrustDialogAccepted": true}});
+        write_json(&from, f);
+        share_trust(&s.fallback, &s.primary, &["/r".to_string()], &backups).unwrap();
+        assert_eq!(backups_of(&backups).len(), 1);
+    }
+
     #[test]
     fn only_a_missing_login_file_means_nothing_to_share() {
         let s = setup();
         let not_a_dir = s.root.join("file");
         fs::write(&not_a_dir, "").unwrap();
-        assert!(share_trust(&not_a_dir, &s.primary, &["/r".to_string()]).is_err());
+        assert!(share_trust(
+            &not_a_dir,
+            &s.primary,
+            &["/r".to_string()],
+            &s.root.join("backups")
+        )
+        .is_err());
     }
 }
