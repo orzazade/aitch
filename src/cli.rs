@@ -314,11 +314,15 @@ pub fn hook(shell: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Start `provider` for the current directory. A profile with a route picks its folder here, once, and says which
 /// and why on stderr; any other profile runs the provider with the environment the shell hook already set.
-pub fn launch(provider: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+pub fn launch(
+    provider: &str,
+    primary: Option<&str>,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
     if provider != "claude" {
         return Err(format!("launch supports claude only, not '{}'", provider).into());
     }
-    start_claude(args)
+    start_claude(primary, args)
 }
 
 /// Run as `claude` through the hook's shim. A start aitch already routed comes back here when a wrapper it started
@@ -330,7 +334,7 @@ pub fn claude_shim(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let err = cmd.args(args).exec();
             Err(cannot_run(&cmd, err))
         }
-        None => start_claude(args),
+        None => start_claude(None, args),
     }
 }
 
@@ -343,11 +347,18 @@ fn cannot_run(cmd: &Command, err: std::io::Error) -> Box<dyn std::error::Error> 
     .into()
 }
 
-fn start_claude(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn start_claude(primary: Option<&str>, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = shim::command(&[])?;
     // A broken config must not stop claude: run it with the folder the hook's cache (last good config) set.
     let cfg = match config::load_config() {
         Ok(c) => c,
+        Err(e) if primary.is_some() => {
+            return Err(format!(
+                "--primary needs a route, and the config does not load: {}",
+                e
+            )
+            .into())
+        }
         Err(e) => {
             eprintln!(
                 "{}",
@@ -365,7 +376,26 @@ fn start_claude(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let r = p.route.as_ref()?.claude.as_ref()?;
         Some((r, p.providers.get("claude")?))
     });
+    if routed.is_none() && primary.is_some() {
+        return Err("--primary needs a route for this folder, and its profile has none".into());
+    }
+    // The caller picked the account, so no org check; but the folder is its full path and has a login, or Claude
+    // Code would read it from wherever it starts and ask to sign in there.
+    let primary = primary.map(resolve::expand_tilde);
+    if let Some(p) = &primary {
+        if !Path::new(p).is_absolute() {
+            return Err(format!("--primary needs an absolute folder, not {:?}", p).into());
+        }
+        route::org_of(Path::new(p)).map_err(|e| format!("not launching claude: {}", e))?;
+    }
     if let Some((r, fallback)) = routed {
+        // A named primary stands in for the route's for this launch.
+        let named = primary.map(|p| config::Route {
+            primary: p,
+            primary_org: None,
+            ..r.clone()
+        });
+        let r = named.as_ref().unwrap_or(r);
         let name = result.profile_name.as_deref().unwrap_or("?");
         let fallback_dir = resolve::expand_tilde(fallback);
         let primary_dir = resolve::expand_tilde(&r.primary);
@@ -404,7 +434,7 @@ fn start_claude(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 Path::new(&primary_dir),
                 std::slice::from_ref(&project),
                 &mcp,
-                || route::read_verdict(&r.quota, route::QUOTA_TIMEOUT),
+                || route::read_verdict(&r.quota, Path::new(&primary_dir), route::QUOTA_TIMEOUT),
             ) {
                 route::Decision::Go(c) => c,
                 route::Decision::Refuse(why) => {

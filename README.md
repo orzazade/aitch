@@ -162,7 +162,7 @@ Each provider sets one variable, the one the tool itself reads:
 | `aitch which` | Show the profile for the current folder and the rule that picked it. |
 | `aitch hook zsh` / `aitch hook bash` | Print the shell hook. Put it in `~/.zshrc` or `~/.bashrc` with `eval`. |
 | `aitch link <from> <to>` | Make `<to>` a Claude Code config folder that shares `<from>`'s rules by symlink. |
-| `aitch launch claude [-- args]` | Start Claude Code with the folder a route picks, as `claude` does after the hook. |
+| `aitch launch claude [--primary <dir>] [-- args]` | Start Claude Code with the folder a route picks, as `claude` does after the hook. `--primary` names the primary folder for this launch. |
 
 Every command takes `--help`.
 
@@ -263,6 +263,13 @@ aitch passes the fallback folder's servers (user scope, plus local scope for the
 to keep the second account's claude.ai connectors out. Because primary launches read servers from the fallback
 folder, `claude mcp …` always runs there. Put `mcp` first, before any flag.
 
+With more than one second account, `aitch launch claude --primary <dir> -- <args>` uses `<dir>` as the primary
+folder for this one launch. Link it first (`aitch link <fallback> <dir>`) and sign in there. The links check, the
+quota command and the fallback rules stay the same; `primary_org` is not checked, since the caller picked the
+account, but `<dir>` must be a full path (or start with `~/`) and be signed in. The quota command must read
+`AITCH_PRIMARY`, or its answer is about some other account. A folder with no route, or a config that does not
+load, refuses `--primary`.
+
 Folder trust carries over too. If the other folder of the route already trusts the launch folder (or one above
 it), aitch marks it trusted in the folder it picked, so Claude Code doesn't ask again.
 
@@ -285,6 +292,9 @@ Any program can be the quota command. aitch runs it without a shell: it splits t
 | 3 | `full` | the fallback folder |
 | 4 | `unknown` | the fallback folder, with a loud warning |
 | anything else, or no valid JSON | — | the fallback folder, with a loud warning and the first stderr line |
+
+aitch sets `AITCH_PRIMARY` to the primary folder it asks about (the route's, or the one `--primary` named), so one
+command can answer for several accounts.
 
 aitch prints `reason` as is, so keep it to one short line. It ignores any other fields.
 

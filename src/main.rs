@@ -82,6 +82,10 @@ enum Commands {
         /// Provider to start: claude
         provider: String,
 
+        /// Use this config folder as the route's primary for this launch (its links and quota checks still apply)
+        #[arg(long)]
+        primary: Option<String>,
+
         /// Arguments passed to the provider unchanged (after --)
         #[arg(last = true)]
         args: Vec<String>,
@@ -140,7 +144,11 @@ fn main() {
         Commands::Status => cli::status(),
         Commands::Which => cli::which(),
         Commands::Hook { shell } => cli::hook(&shell),
-        Commands::Launch { provider, args } => cli::launch(&provider, &args),
+        Commands::Launch {
+            provider,
+            primary,
+            args,
+        } => cli::launch(&provider, primary.as_deref(), &args),
         Commands::Link { from, to } => cli::link(&from, &to),
     };
 

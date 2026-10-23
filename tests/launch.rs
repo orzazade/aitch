@@ -215,6 +215,165 @@ fn unknown_launches_on_work_loudly() {
     );
 }
 
+/// A third folder linked from the fallback one and logged in to its own organization.
+fn second_primary(e: &Env) -> PathBuf {
+    let alt = e.home.join(".claude-alt2");
+    let out = e.run(
+        &e.home,
+        &["link", &e.work_s(), &alt.to_string_lossy().to_string()],
+    );
+    assert!(out.status.success(), "link: {}", text(&out.stderr));
+    login(&alt, "org-other");
+    alt
+}
+
+#[test]
+fn primary_option_launches_on_the_named_folder_and_tells_the_quota_command() {
+    let e = Env::new(
+        "echo \"{\\\"verdict\\\":\\\"room\\\",\\\"reason\\\":\\\"asked for $AITCH_PRIMARY\\\"}\"\n",
+    );
+    let alt = second_primary(&e);
+    let out = e.run(
+        &e.acme,
+        &[
+            "launch",
+            "claude",
+            "--primary",
+            &alt.to_string_lossy(),
+            "--",
+            "x",
+        ],
+    );
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "{se}");
+    assert!(so.contains(&format!("DIR={}\n", alt.display())), "{so}");
+    assert!(
+        so.contains("ARG=--mcp-config=") && so.contains("ARG=x\n"),
+        "{so}"
+    );
+    // Its login is not primary_org: the caller picked the account, so that guard is not the one to apply.
+    assert!(
+        se.contains(&format!("work → primary ({})", alt.display())),
+        "{se}"
+    );
+    assert!(se.contains(&format!("asked for {}", alt.display())), "{se}");
+}
+
+#[test]
+fn the_quota_command_is_told_the_route_primary_folder() {
+    let e = Env::new(
+        "echo \"{\\\"verdict\\\":\\\"room\\\",\\\"reason\\\":\\\"asked for $AITCH_PRIMARY\\\"}\"\n",
+    );
+    let out = e.run(&e.acme, &["launch", "claude"]);
+    let se = text(&out.stderr);
+    assert!(se.contains(&format!("asked for {}", e.primary_s())), "{se}");
+}
+
+#[test]
+fn primary_option_still_needs_the_links_and_room() {
+    let e = Env::new(FULL);
+    let alt = second_primary(&e);
+    let out = e.run(
+        &e.acme,
+        &["launch", "claude", "--primary", &alt.to_string_lossy()],
+    );
+    let so = text(&out.stdout);
+    assert!(so.contains(&format!("DIR={}\n", e.work_s())), "{so}");
+
+    let e = Env::new(ROOM);
+    let alt = second_primary(&e);
+    fs::remove_file(alt.join("CLAUDE.md")).unwrap();
+    fs::write(alt.join("CLAUDE.md"), "other rules").unwrap();
+    let out = e.run(
+        &e.acme,
+        &["launch", "claude", "--primary", &alt.to_string_lossy()],
+    );
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert!(so.contains(&format!("DIR={}\n", e.work_s())), "{so}");
+    assert!(se.contains("NOT USING THE PRIMARY DIR"), "{se}");
+}
+
+#[test]
+fn primary_option_without_a_route_refuses() {
+    let e = Env::new(ROOM);
+    let alt = second_primary(&e);
+    let out = e.run(
+        &e.personal,
+        &["launch", "claude", "--primary", &alt.to_string_lossy()],
+    );
+    assert!(!out.status.success());
+    assert!(text(&out.stdout).is_empty(), "claude ran");
+    assert!(
+        text(&out.stderr).contains("--primary needs a route"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn primary_option_with_a_broken_config_refuses() {
+    let e = Env::new(ROOM);
+    let alt = second_primary(&e);
+    fs::write(e.home.join(".aitch/config.yaml"), "profiles: [").unwrap();
+    let out = e.run(
+        &e.acme,
+        &["launch", "claude", "--primary", &alt.to_string_lossy()],
+    );
+    assert!(!out.status.success());
+    assert!(text(&out.stdout).is_empty(), "claude ran");
+    assert!(
+        text(&out.stderr).contains("the config does not load"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn primary_option_takes_a_home_path_and_refuses_an_empty_or_relative_one() {
+    let e = Env::new(ROOM);
+    let alt = second_primary(&e);
+    let out = e.run(
+        &e.acme,
+        &["launch", "claude", "--primary", "~/.claude-alt2", "--", "x"],
+    );
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "{se}");
+    assert!(so.contains(&format!("DIR={}\n", alt.display())), "{so}");
+    for bad in ["", ".", "../.claude-alt2"] {
+        let out = e.run(&e.acme, &["launch", "claude", "--primary", bad]);
+        assert!(!out.status.success(), "{bad:?}");
+        assert!(text(&out.stdout).is_empty(), "{bad:?}: claude ran");
+        assert!(
+            text(&out.stderr).contains("--primary needs an absolute folder"),
+            "{bad:?}: {}",
+            text(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn primary_option_on_a_folder_with_no_login_refuses() {
+    let e = Env::new(ROOM);
+    let alt = e.home.join(".claude-alt3");
+    let out = e.run(
+        &e.home,
+        &["link", &e.work_s(), &alt.to_string_lossy().to_string()],
+    );
+    assert!(out.status.success(), "link: {}", text(&out.stderr));
+    let out = e.run(
+        &e.acme,
+        &["launch", "claude", "--primary", &alt.to_string_lossy()],
+    );
+    assert!(!out.status.success());
+    assert!(text(&out.stdout).is_empty(), "claude ran");
+    assert!(
+        text(&out.stderr).contains("not launching claude")
+            && text(&out.stderr).contains(".claude-alt3"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
 #[test]
 fn exit_code_of_claude_comes_back() {
     let e = Env::new(ROOM);

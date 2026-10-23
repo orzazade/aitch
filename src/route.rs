@@ -55,7 +55,8 @@ pub enum Decision {
 
 /// Run the quota command (split on whitespace, `~` expanded in the program) and read its verdict.
 /// Room only on exit 0 with "room"; full only on exit 3 with "full"; anything else is unknown.
-pub fn read_verdict(cmd: &str, timeout: Duration) -> Verdict {
+/// The command gets AITCH_PRIMARY set to the primary dir it is asked about.
+pub fn read_verdict(cmd: &str, primary: &Path, timeout: Duration) -> Verdict {
     let mut words = cmd.split_whitespace();
     let Some(prog) = words.next() else {
         return Verdict::Unknown("quota command is empty".into());
@@ -63,6 +64,7 @@ pub fn read_verdict(cmd: &str, timeout: Duration) -> Verdict {
     let prog = expand_tilde(prog);
     let mut child = match Command::new(&prog)
         .args(words)
+        .env("AITCH_PRIMARY", primary)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -792,7 +794,7 @@ mod tests {
         let t = TempDir::new().unwrap();
         let cmd = fake_quota(t.path(), r#"{"verdict":"room","reason":"7d 43%"}"#, 0);
         assert_eq!(
-            read_verdict(&cmd, QUOTA_TIMEOUT),
+            read_verdict(&cmd, Path::new("/p"), QUOTA_TIMEOUT),
             Verdict::Room("7d 43%".into())
         );
     }
@@ -802,7 +804,7 @@ mod tests {
         let t = TempDir::new().unwrap();
         let cmd = fake_quota(t.path(), r#"{"verdict":"full","reason":"7d 100%"}"#, 3);
         assert_eq!(
-            read_verdict(&cmd, QUOTA_TIMEOUT),
+            read_verdict(&cmd, Path::new("/p"), QUOTA_TIMEOUT),
             Verdict::Full("7d 100%".into())
         );
     }
@@ -818,14 +820,17 @@ mod tests {
     fn reader_unknown_on_exit_4() {
         let t = TempDir::new().unwrap();
         let cmd = fake_quota(t.path(), r#"{"verdict":"unknown","reason":"no sample"}"#, 4);
-        unknown_containing(read_verdict(&cmd, QUOTA_TIMEOUT), "no sample");
+        unknown_containing(
+            read_verdict(&cmd, Path::new("/p"), QUOTA_TIMEOUT),
+            "no sample",
+        );
     }
 
     #[test]
     fn reader_room_with_nonzero_exit_is_unknown() {
         let t = TempDir::new().unwrap();
         let cmd = fake_quota(t.path(), r#"{"verdict":"room","reason":"x"}"#, 1);
-        unknown_containing(read_verdict(&cmd, QUOTA_TIMEOUT), "exit 1");
+        unknown_containing(read_verdict(&cmd, Path::new("/p"), QUOTA_TIMEOUT), "exit 1");
     }
 
     #[test]
@@ -839,7 +844,11 @@ mod tests {
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         unknown_containing(
-            read_verdict(&format!("/bin/sh {}", path.display()), QUOTA_TIMEOUT),
+            read_verdict(
+                &format!("/bin/sh {}", path.display()),
+                Path::new("/p"),
+                QUOTA_TIMEOUT,
+            ),
             "db locked",
         );
     }
@@ -848,13 +857,17 @@ mod tests {
     fn reader_full_with_exit_0_is_unknown() {
         let t = TempDir::new().unwrap();
         let cmd = fake_quota(t.path(), r#"{"verdict":"full","reason":"x"}"#, 0);
-        unknown_containing(read_verdict(&cmd, QUOTA_TIMEOUT), "full");
+        unknown_containing(read_verdict(&cmd, Path::new("/p"), QUOTA_TIMEOUT), "full");
     }
 
     #[test]
     fn reader_missing_command_is_unknown() {
         unknown_containing(
-            read_verdict("/nonexistent/quota-tool quota --room", QUOTA_TIMEOUT),
+            read_verdict(
+                "/nonexistent/quota-tool quota --room",
+                Path::new("/p"),
+                QUOTA_TIMEOUT,
+            ),
             "/nonexistent/quota-tool",
         );
     }
@@ -863,14 +876,17 @@ mod tests {
     fn reader_not_json_is_unknown() {
         let t = TempDir::new().unwrap();
         let cmd = fake_quota(t.path(), "not json", 0);
-        unknown_containing(read_verdict(&cmd, QUOTA_TIMEOUT), "exit 0");
+        unknown_containing(read_verdict(&cmd, Path::new("/p"), QUOTA_TIMEOUT), "exit 0");
     }
 
     #[test]
     fn reader_json_without_verdict_is_unknown() {
         let t = TempDir::new().unwrap();
         let cmd = fake_quota(t.path(), r#"{"reason":"x"}"#, 0);
-        unknown_containing(read_verdict(&cmd, QUOTA_TIMEOUT), "verdict");
+        unknown_containing(
+            read_verdict(&cmd, Path::new("/p"), QUOTA_TIMEOUT),
+            "verdict",
+        );
     }
 
     #[test]
@@ -880,7 +896,11 @@ mod tests {
         fs::write(&path, "#!/bin/sh\necho 'store missing' >&2\nexit 4\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         unknown_containing(
-            read_verdict(&format!("/bin/sh {}", path.display()), QUOTA_TIMEOUT),
+            read_verdict(
+                &format!("/bin/sh {}", path.display()),
+                Path::new("/p"),
+                QUOTA_TIMEOUT,
+            ),
             "store missing",
         );
     }
@@ -899,6 +919,7 @@ mod tests {
         unknown_containing(
             read_verdict(
                 &format!("/bin/sh {}", path.display()),
+                Path::new("/p"),
                 Duration::from_millis(300),
             ),
             "took",
@@ -924,6 +945,7 @@ mod tests {
         unknown_containing(
             read_verdict(
                 &format!("/bin/sh {}", path.display()),
+                Path::new("/p"),
                 Duration::from_millis(300),
             ),
             "took",
