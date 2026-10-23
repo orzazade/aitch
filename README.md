@@ -259,8 +259,11 @@ the environment instead.
 
 Claude Code picks the settings file and the login by `CLAUDE_CONFIG_DIR`, not by the folder: set to `~/.claude`, it
 reads `~/.claude/.claude.json` and another keychain item than with the variable unset. So aitch starts the default
-folder `~/.claude` (or a link to it) only with the variable unset, on every launch and in the hook, even when the
-config names it by its path. Its settings are then always `~/.claude.json`.
+folder `~/.claude` only with the variable unset, on every launch and in the hook, even when the config names it by
+its path. Its settings are then always `~/.claude.json`; when that is a link (dotfiles), aitch writes the file it
+points to and keeps the link, as Claude Code does. A link to `~/.claude` under another name, such as
+`~/.claude-personal`, is a folder of its own to Claude Code, with its own login, and aitch keeps it set. `aitch
+doctor` says when a login is still kept for `CLAUDE_CONFIG_DIR=~/.claude`, which aitch no longer uses.
 
 MCP sign-ins (OAuth) are not copied: Claude Code keeps them in the folder's keychain item, next to its login. Sign
 in once per folder with `/mcp`. `aitch doctor` lists, per folder, the login, whether its servers and answers match

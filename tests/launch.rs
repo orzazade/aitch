@@ -1260,6 +1260,71 @@ fn a_shell_that_names_the_default_folder_gets_it_unset() {
 }
 
 #[test]
+fn a_linked_home_settings_file_is_written_where_it_points_and_stays_a_link() {
+    // Claude Code writes ~/.claude.json through its link (and locks ~/.claude.json.lock); so does aitch.
+    let e = Env::new(ROOM);
+    let (_, max) = routed_default(&e, FULL);
+    let dots = e.home.join("dots");
+    fs::create_dir_all(&dots).unwrap();
+    fs::rename(e.home.join(".claude.json"), dots.join("claude.json")).unwrap();
+    std::os::unix::fs::symlink(dots.join("claude.json"), e.home.join(".claude.json")).unwrap();
+    let mut m = json_of(&max);
+    m["projects"] =
+        serde_json::json!({ e.personal.to_string_lossy(): {"hasTrustDialogAccepted": true}});
+    set_json(&max, m);
+    let out = e.run(&e.personal, &["launch", "claude"]);
+    let se = text(&out.stderr);
+    assert!(out.status.success(), "{se}");
+    assert!(!se.contains("not shared"), "{se}");
+    let t: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dots.join("claude.json")).unwrap()).unwrap();
+    assert_eq!(
+        t["projects"][e.personal.to_string_lossy().as_ref()]["hasTrustDialogAccepted"],
+        true,
+        "{t}"
+    );
+    assert_eq!(t["oauthAccount"]["organizationUuid"], "org-personal", "{t}");
+    assert!(fs::symlink_metadata(e.home.join(".claude.json"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn a_shell_that_names_a_link_to_the_default_folder_keeps_it() {
+    // Another name is another login item to Claude Code, and it may hold the login in use.
+    let e = Env::new(ROOM);
+    let (own, _) = personal_max(&e);
+    let alias = e.home.join(".claude-personal");
+    std::os::unix::fs::symlink(&own, &alias).unwrap();
+    let out = e
+        .cmd(&e.personal, &["launch", "claude"])
+        .env("CLAUDE_CONFIG_DIR", &alias)
+        .locked_output()
+        .unwrap();
+    assert!(
+        text(&out.stdout).contains(&format!("DIR={}\n", alias.display())),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn a_source_whose_rules_link_into_the_home_folder_is_still_a_source() {
+    let e = Env::new(ROOM);
+    let (own, _) = personal_max(&e);
+    fs::write(e.home.join("CLAUDE.md"), "dotfile").unwrap();
+    fs::remove_file(own.join("CLAUDE.md")).unwrap();
+    std::os::unix::fs::symlink(e.home.join("CLAUDE.md"), own.join("CLAUDE.md")).unwrap();
+    let fresh = e.home.join(".claude-new");
+    let out = e.run(
+        &e.home,
+        &["link", &own.to_string_lossy(), &fresh.to_string_lossy()],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+#[test]
 fn primary_option_starts_the_folder_as_named_without_a_trailing_slash() {
     // Claude Code names the login item after the exact string: "~/.claude-max/" would look for another login.
     let e = Env::new(ROOM);
@@ -1400,6 +1465,32 @@ fn section_of(so: &str, dir: &Path) -> String {
     let rest = &so[at..];
     let end = rest[1..].find("\n/").map_or(rest.len(), |i| i + 1);
     rest[..end].to_string()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn doctor_names_a_login_kept_under_the_default_folders_path_which_aitch_no_longer_uses() {
+    let e = Env::new(ROOM);
+    let (own, _) = personal_max(&e);
+    let bare = r#"{"claudeAiOauth":{"accessToken":"SECRET-TOKEN-123"}}"#;
+    fake_logins(
+        &e,
+        &[
+            (&own, None, bare),
+            (&own, Some(&own.to_string_lossy()), bare),
+        ],
+    );
+    let out = e.run(&e.home, &["doctor"]);
+    let so = text(&out.stdout);
+    assert!(!so.contains("SECRET"), "{so}");
+    let o = section_of(&so, &own);
+    assert!(
+        o.contains(&format!(
+            "another login is kept for CLAUDE_CONFIG_DIR={}",
+            own.display()
+        )),
+        "{o}"
+    );
 }
 
 #[test]

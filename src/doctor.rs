@@ -24,11 +24,16 @@ pub fn oauth_key(name: &str, server: &Json) -> String {
     format!("{name}|{}", &hash[..16])
 }
 
-/// Whether Claude Code signs in to this server with OAuth: a remote (http, sse) one with no headers of its own (an
-/// Authorization or API key header) and no headers helper.
+/// Whether Claude Code signs in to this server with OAuth: a remote (http, sse) one with no credential header of its
+/// own (a name with "auth", "key" or "token" in it) and no headers helper. Any other header leaves it to OAuth.
 pub fn needs_oauth(server: &Json) -> bool {
     let remote = matches!(server["type"].as_str(), Some("http" | "sse"));
-    let own_auth = server["headers"].as_object().is_some_and(|h| !h.is_empty());
+    let own_auth = server["headers"].as_object().is_some_and(|h| {
+        h.keys().any(|k| {
+            let k = k.to_ascii_lowercase();
+            ["auth", "key", "token"].iter().any(|w| k.contains(w))
+        })
+    });
     remote && !own_auth && server.get("headersHelper").is_none()
 }
 
@@ -163,6 +168,23 @@ pub fn run(cfg: &Config) -> usize {
             Err(e) => bad(format!("CANNOT READ THE LOGIN: {e}")),
         };
         println!("  login: {line}");
+        // A login stored while something set CLAUDE_CONFIG_DIR to this path: a keychain item of its own (macOS).
+        if cfg!(target_os = "macos") && route::is_default_dir(&dir) {
+            if let Ok(Some(c)) = credentials(&dir, false) {
+                if has(&c["claudeAiOauth"], "accessToken")
+                    || has(&c["claudeAiOauth"], "refreshToken")
+                {
+                    println!(
+                        "  {}",
+                        format!(
+                            "note: another login is kept for CLAUDE_CONFIG_DIR={}; aitch starts this folder unset and does not use it",
+                            dir.display()
+                        )
+                        .yellow()
+                    );
+                }
+            }
+        }
         // A linked folder should carry its source's servers: check the sign-ins against those.
         let mut servers = own_read;
         if let Ok(Some(src)) = &source {
@@ -278,6 +300,10 @@ mod tests {
         // A key in a header of another name is its own sign-in too.
         assert!(!needs_oauth(
             &serde_json::json!({"type": "http", "url": "u", "headers": {"X-API-Key": "k"}})
+        ));
+        // A header that carries no key leaves the sign-in to OAuth: report it, do not pass it.
+        assert!(needs_oauth(
+            &serde_json::json!({"type": "http", "url": "u", "headers": {"X-Trace": "1"}})
         ));
     }
 

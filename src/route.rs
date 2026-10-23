@@ -149,12 +149,14 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
     matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
 }
 
-/// Whether `dir` is the default folder, by name (a trailing '/' aside) or on disk. aitch starts it only with
-/// CLAUDE_CONFIG_DIR unset (`set_config_dir`, and the hook): Claude Code goes by the variable, not the folder, and
-/// set to this folder it would read `~/.claude/.claude.json` and another login item.
+/// Whether `dir` names the default folder: `~/.claude` (a trailing '/' aside) or the path it resolves to. aitch starts
+/// it only with CLAUDE_CONFIG_DIR unset (`set_config_dir`, and the hook): Claude Code goes by the variable, not the
+/// folder, and set to this folder it would read `~/.claude/.claude.json` and another login item. A link of another
+/// name (`~/.claude-personal`) is another folder to Claude Code, with a login item of its own, and stays one.
 pub fn is_default_dir(dir: &Path) -> bool {
     let d = default_dir();
-    Path::new(dir.to_string_lossy().trim_end_matches('/')) == d || same_dir(dir, &d)
+    let p = Path::new(dir.to_string_lossy().trim_end_matches('/')).to_path_buf();
+    p == d || fs::canonicalize(&d).is_ok_and(|c| p == c)
 }
 
 /// Make `cmd` start Claude Code on `dir`: CLAUDE_CONFIG_DIR unset for the default folder, else set to it.
@@ -461,18 +463,19 @@ fn take_lock(file: &Path) -> Result<PathBuf, String> {
 /// Change `dir`'s settings file (`config_file`) through `edit`, which returns None when it changes nothing; then
 /// nothing is written. A write happens under Claude Code's lock: read the file again there, back it up into
 /// `backups`, and replace it atomically, same mode, only if nobody wrote it meanwhile, else try again. A missing file
-/// starts as `{}` and is created with mode 0600. Never writes through a symlink.
+/// starts as `{}` and is created with mode 0600. Never writes through a symlink but `~/.claude.json`'s (`write_target`).
 fn edit_claude_json<R>(
     dir: &Path,
     backups: &Path,
     edit: &dyn Fn(&mut Object) -> Result<Option<R>, String>,
 ) -> Result<Option<R>, String> {
-    let path = config_file(dir);
+    let path = write_target(dir)?;
     // A look without the lock first: most launches change nothing and need not wait for it.
     if edit(&mut read_current(&path)?.0)?.is_none() {
         return Ok(None);
     }
-    let lock = take_lock(&path)?;
+    // Claude Code locks the name it opens, not the file a link leads to.
+    let lock = take_lock(&config_file(dir))?;
     let result = (|| {
         for _ in 0..3 {
             let (mut json, before) = read_current(&path)?;
@@ -490,6 +493,17 @@ fn edit_claude_json<R>(
     })();
     let _ = fs::remove_dir(&lock);
     result
+}
+
+/// The file aitch reads and replaces for `dir`: its `config_file`, but where `~/.claude.json` is a link (dotfiles), the
+/// file it leads to, as Claude Code writes it; the link stays. A link in any other folder is refused by `read_current`.
+fn write_target(dir: &Path) -> Result<PathBuf, String> {
+    let path = config_file(dir);
+    if is_default_dir(dir) && fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()));
+    }
+    Ok(path)
 }
 
 /// The file as an object, and its metadata and text as read (None: there is no file).
@@ -677,7 +691,9 @@ fn links_into(dir: &Path) -> Result<Option<PathBuf>, String> {
         else {
             continue;
         };
-        if !config_file(&folder).exists() {
+        // The home folder holds ~/.claude.json, but a rule linked from there (dotfiles) is no config folder.
+        let home = dirs::home_dir().and_then(|h| fs::canonicalize(h).ok());
+        if !config_file(&folder).exists() || home.as_ref() == Some(&folder) {
             continue;
         }
         match &found {
@@ -833,7 +849,7 @@ fn sync(from: &Path, to: &Path, backups: Option<&Path>) -> Result<Synced, String
     };
     let done = match backups {
         Some(b) => edit_claude_json(to, b, &edit)?,
-        None => edit(&mut read_current(&config_file(to))?.0)?,
+        None => edit(&mut read_current(&write_target(to)?)?.0)?,
     };
     Ok(done.unwrap_or_default())
 }
@@ -1932,6 +1948,8 @@ mod tests {
         fs::write(&path, r#"{"theirs": 1}"#).unwrap();
         assert!(!replace(&path, &json, before.as_ref(), &backups).unwrap());
         assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"theirs": 1}"#);
+        // The backup is made before the check, so only the rename follows it.
+        assert_eq!(backups_of(&backups).len(), 1);
         let left: Vec<_> = fs::read_dir(&s.primary)
             .unwrap()
             .filter_map(Result::ok)
