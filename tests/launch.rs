@@ -218,10 +218,7 @@ fn unknown_launches_on_work_loudly() {
 /// A third folder linked from the fallback one and logged in to its own organization.
 fn second_primary(e: &Env) -> PathBuf {
     let alt = e.home.join(".claude-alt2");
-    let out = e.run(
-        &e.home,
-        &["link", &e.work_s(), &alt.to_string_lossy().to_string()],
-    );
+    let out = e.run(&e.home, &["link", &e.work_s(), &alt.to_string_lossy()]);
     assert!(out.status.success(), "link: {}", text(&out.stderr));
     login(&alt, "org-other");
     alt
@@ -355,10 +352,7 @@ fn primary_option_takes_a_home_path_and_refuses_an_empty_or_relative_one() {
 fn primary_option_on_a_folder_with_no_login_refuses() {
     let e = Env::new(ROOM);
     let alt = e.home.join(".claude-alt3");
-    let out = e.run(
-        &e.home,
-        &["link", &e.work_s(), &alt.to_string_lossy().to_string()],
-    );
+    let out = e.run(&e.home, &["link", &e.work_s(), &alt.to_string_lossy()]);
     assert!(out.status.success(), "link: {}", text(&out.stderr));
     let out = e.run(
         &e.acme,
