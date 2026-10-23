@@ -149,10 +149,27 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
     matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
 }
 
-/// The file Claude Code keeps a folder's settings and login in: `.claude.json` inside it, but for the default folder
-/// `~/.claude.json`, beside it.
+/// Whether `dir` is the default folder, by name (a trailing '/' aside) or on disk. aitch starts it only with
+/// CLAUDE_CONFIG_DIR unset (`set_config_dir`, and the hook): Claude Code goes by the variable, not the folder, and
+/// set to this folder it would read `~/.claude/.claude.json` and another login item.
+pub fn is_default_dir(dir: &Path) -> bool {
+    let d = default_dir();
+    Path::new(dir.to_string_lossy().trim_end_matches('/')) == d || same_dir(dir, &d)
+}
+
+/// Make `cmd` start Claude Code on `dir`: CLAUDE_CONFIG_DIR unset for the default folder, else set to it.
+pub fn set_config_dir(cmd: &mut Command, dir: &Path) {
+    if is_default_dir(dir) {
+        cmd.env_remove("CLAUDE_CONFIG_DIR");
+    } else {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
+}
+
+/// The file Claude Code keeps a folder's settings and login in, as aitch starts it: `.claude.json` inside it, but for
+/// the default folder `~/.claude.json`, beside it.
 pub fn config_file(dir: &Path) -> PathBuf {
-    if same_dir(dir, &default_dir()) {
+    if is_default_dir(dir) {
         dirs::home_dir().unwrap_or_default().join(".claude.json")
     } else {
         dir.join(".claude.json")
@@ -223,6 +240,14 @@ pub fn link(from: &Path, to: &Path) -> Result<Vec<String>, String> {
     }
     // A link stores its target as written, and a relative one would resolve from inside `to`.
     let from = &std::path::absolute(from).map_err(|e| format!("{}: {e}", from.display()))?;
+    if let Some(up) = links_into(from)? {
+        return Err(format!(
+            "{} is itself linked to {}; link to {} instead",
+            from.display(),
+            up.display(),
+            up.display()
+        ));
+    }
     // The links would land in whatever folder it points to. A trailing '/' makes the check follow the link.
     let raw = to.as_os_str().as_bytes();
     let end = raw.iter().rposition(|&b| b != b'/').map_or(1, |i| i + 1);
@@ -277,8 +302,8 @@ pub fn write_mcp(fallback_dir: &Path, folders: &[String], out: &Path) -> Result<
             serde_json::Value::Object(m) => servers.extend(m.clone()),
             _ => {
                 return Err(format!(
-                    "{key} in {}/.claude.json is not an object",
-                    fallback_dir.display()
+                    "{key} in {} is not an object",
+                    config_file(fallback_dir).display()
                 ))
             }
         }
@@ -364,7 +389,7 @@ pub fn share_trust(
         .filter(|(k, v)| v["hasTrustDialogAccepted"] == true && covers(k))
         .map(|(k, _)| k)
         .collect();
-    let what = to.join(".claude.json").display().to_string();
+    let what = config_file(to).display().to_string();
     let marked = edit_claude_json(to, backups, &|dst| {
         let todo: Vec<String> = wanted
             .iter()
@@ -399,10 +424,12 @@ fn object_in<'a>(map: &'a mut Object, key: &str, file: &str) -> Result<&'a mut O
         .ok_or_else(|| format!("{key} in {file} is not an object"))
 }
 
-/// Take the lock Claude Code changes `dir/.claude.json` under (a folder); wait a little for it, never take it over.
+/// Take the lock Claude Code changes `file` under (a folder `<file>.lock`); wait a little for it, never take it over.
 /// Returns the lock to remove when done.
-fn take_lock(dir: &Path) -> Result<PathBuf, String> {
-    let lock = dir.join(".claude.json.lock");
+fn take_lock(file: &Path) -> Result<PathBuf, String> {
+    let mut lock = file.as_os_str().to_owned();
+    lock.push(".lock");
+    let lock = PathBuf::from(lock);
     let mut tries = 0;
     while let Err(e) = fs::create_dir(&lock) {
         tries += 1;
@@ -431,21 +458,21 @@ fn take_lock(dir: &Path) -> Result<PathBuf, String> {
     Ok(lock)
 }
 
-/// Change `dir/.claude.json` through `edit`, which returns None when it changes nothing; then nothing is written. A
-/// write happens under Claude Code's lock: read the file again there, back it up into `backups`, and replace it
-/// atomically, same mode, only if nobody wrote it meanwhile, else try again. A missing file starts as `{}` and is
-/// created with mode 0600. Never writes through a symlink.
+/// Change `dir`'s settings file (`config_file`) through `edit`, which returns None when it changes nothing; then
+/// nothing is written. A write happens under Claude Code's lock: read the file again there, back it up into
+/// `backups`, and replace it atomically, same mode, only if nobody wrote it meanwhile, else try again. A missing file
+/// starts as `{}` and is created with mode 0600. Never writes through a symlink.
 fn edit_claude_json<R>(
     dir: &Path,
     backups: &Path,
     edit: &dyn Fn(&mut Object) -> Result<Option<R>, String>,
 ) -> Result<Option<R>, String> {
-    let path = dir.join(".claude.json");
+    let path = config_file(dir);
     // A look without the lock first: most launches change nothing and need not wait for it.
     if edit(&mut read_current(&path)?.0)?.is_none() {
         return Ok(None);
     }
-    let lock = take_lock(dir)?;
+    let lock = take_lock(&path)?;
     let result = (|| {
         for _ in 0..3 {
             let (mut json, before) = read_current(&path)?;
@@ -490,7 +517,8 @@ fn read_current(path: &Path) -> Result<Current, String> {
 }
 
 /// Replace `path` with `json` if it is still as `before` found it (None: still missing), backing up the old text
-/// first. False when it changed meanwhile: another writer that skipped the lock keeps its version.
+/// first. False when it changed meanwhile: another writer that skipped the lock keeps its version. The backup and
+/// the new file are written before that check, so only the rename follows it.
 fn replace(
     path: &Path,
     json: &Object,
@@ -511,6 +539,9 @@ fn replace(
         }
         f.write_all(body.as_bytes())?;
         f.sync_all()?;
+        if let Some((_, text)) = before {
+            backup(backups, path, text)?;
+        }
         let same = match (before, fs::symlink_metadata(path)) {
             (None, Err(e)) => e.kind() == std::io::ErrorKind::NotFound,
             (Some((meta, _)), Ok(now)) => {
@@ -522,9 +553,6 @@ fn replace(
         };
         if !same {
             return Ok(false);
-        }
-        if let Some((_, text)) = before {
-            backup(backups, path, text)?;
         }
         fs::rename(&tmp, path)?;
         Ok(true)
@@ -614,9 +642,28 @@ const ANSWERS: &[&str] = &[
 const APPROVALS: &[&str] = &["enabledMcpjsonServers"];
 
 /// The folder whose rules `dir` links to (see `link`): None when it links into no config folder (a source itself),
-/// an error when its links point into more than one or miss one. A config folder is one with a `.claude.json`, so a
-/// source whose CLAUDE.md is a link into a dotfiles repo is still a source.
+/// an error when its links point into more than one, miss one, or lead to a folder that is itself linked (its
+/// servers would be kept there and lost at that folder's next sync). A config folder is one with a `.claude.json`,
+/// so a source whose CLAUDE.md is a link into a dotfiles repo is still a source.
 pub fn source_of(dir: &Path) -> Result<Option<PathBuf>, String> {
+    let Some(src) = links_into(dir)? else {
+        return Ok(None);
+    };
+    if let Some(up) = links_into(&src)? {
+        return Err(format!(
+            "{} links to {}, which is itself linked to {}; link it to {} instead",
+            dir.display(),
+            src.display(),
+            up.display(),
+            up.display()
+        ));
+    }
+    check_links(&src, dir)?;
+    Ok(Some(src))
+}
+
+/// The one config folder `dir`'s LINKS point into, if any.
+fn links_into(dir: &Path) -> Result<Option<PathBuf>, String> {
     let mut found: Option<PathBuf> = None;
     for name in LINKS {
         let at = dir.join(name);
@@ -645,11 +692,7 @@ pub fn source_of(dir: &Path) -> Result<Option<PathBuf>, String> {
             _ => found = Some(folder),
         }
     }
-    let Some(src) = found else {
-        return Ok(None);
-    };
-    check_links(&src, dir)?;
-    Ok(Some(src))
+    Ok(found)
 }
 
 /// Make `map[key]` the servers `want` names (an object, or null for none); report each name that changes.
@@ -707,15 +750,15 @@ pub fn sync_preview(from: &Path, to: &Path) -> Result<Synced, String> {
 
 fn sync(from: &Path, to: &Path, backups: Option<&Path>) -> Result<Synced, String> {
     let src = claude_json(from)?;
-    let file = to.join(".claude.json").display().to_string();
+    let file = config_file(to).display().to_string();
     let none = Object::new();
     let src_projects = match &src["projects"] {
         Json::Null => &none,
         Json::Object(m) => m,
         _ => {
             return Err(format!(
-                "projects in {}/.claude.json is not an object",
-                from.display()
+                "projects in {} is not an object",
+                config_file(from).display()
             ))
         }
     };
@@ -790,7 +833,7 @@ fn sync(from: &Path, to: &Path, backups: Option<&Path>) -> Result<Synced, String
     };
     let done = match backups {
         Some(b) => edit_claude_json(to, b, &edit)?,
-        None => edit(&mut read_current(&to.join(".claude.json"))?.0)?,
+        None => edit(&mut read_current(&config_file(to))?.0)?,
     };
     Ok(done.unwrap_or_default())
 }
@@ -1655,7 +1698,7 @@ mod tests {
             &s.fallback.join(".claude.json"),
             serde_json::json!({"oauthAccount": {"organizationUuid": FALLBACK_ORG},
                 "mcpServers": {"github": {"command": "gh-mcp", "args": ["new"]},
-                               "cortex": {"type": "http", "url": "https://c/mcp"}}}),
+                               "notes": {"type": "http", "url": "https://c/mcp"}}}),
         );
         write_json(
             &s.primary.join(".claude.json"),
@@ -1665,7 +1708,7 @@ mod tests {
         );
         let mut got = sync_config(&s.fallback, &s.primary, &backups).unwrap();
         got.servers.sort();
-        assert_eq!(got.servers, ["+cortex", "-old", "~github"]);
+        assert_eq!(got.servers, ["+notes", "-old", "~github"]);
         let t = read_json(&s.primary.join(".claude.json"));
         assert_eq!(
             t["mcpServers"],
@@ -1799,11 +1842,11 @@ mod tests {
         write_json(
             &s.fallback.join(".claude.json"),
             serde_json::json!({"oauthAccount": {"organizationUuid": FALLBACK_ORG},
-                "mcpServers": {"cortex": {"type": "http", "url": "https://c/mcp"}},
+                "mcpServers": {"notes": {"type": "http", "url": "https://c/mcp"}},
                 "projects": {"/r": {"hasTrustDialogAccepted": true}}}),
         );
         let got = sync_config(&s.fallback, &to, &backups).unwrap();
-        assert_eq!(got.servers, ["+cortex"]);
+        assert_eq!(got.servers, ["+notes"]);
         let t = read_json(&to.join(".claude.json"));
         assert!(t.get("oauthAccount").is_none(), "no login copied: {t}");
         assert_eq!(t["projects"]["/r"]["hasTrustDialogAccepted"], true);
@@ -1861,6 +1904,40 @@ mod tests {
         write_json(&from, f);
         share_trust(&s.fallback, &s.primary, &["/r".to_string()], &backups).unwrap();
         assert_eq!(backups_of(&backups).len(), 1);
+    }
+
+    #[test]
+    fn a_folder_linked_to_a_linked_folder_is_refused_not_followed() {
+        // B's servers would be kept in A, and A's next sync from R removes them.
+        let s = setup();
+        let b = s.root.join("b");
+        let err = link(&s.primary, &b).unwrap_err();
+        assert!(err.contains("is itself linked to"), "{err}");
+        assert!(!b.exists(), "nothing made");
+        // Made by hand: an error, not a source.
+        fs::create_dir_all(&b).unwrap();
+        for name in ["CLAUDE.md", "settings.json", "skills", "projects"] {
+            symlink(s.primary.join(name), b.join(name)).unwrap();
+        }
+        let err = source_of(&b).unwrap_err();
+        assert!(err.contains("is itself linked to"), "{err}");
+    }
+
+    #[test]
+    fn a_file_changed_after_it_was_read_is_left_to_the_other_writer() {
+        let s = setup();
+        let backups = s.root.join("backups");
+        let path = s.primary.join(".claude.json");
+        let (json, before) = read_current(&path).unwrap();
+        fs::write(&path, r#"{"theirs": 1}"#).unwrap();
+        assert!(!replace(&path, &json, before.as_ref(), &backups).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"theirs": 1}"#);
+        let left: Vec<_> = fs::read_dir(&s.primary)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains("aitch"))
+            .collect();
+        assert!(left.is_empty(), "temp file left: {left:?}");
     }
 
     #[test]

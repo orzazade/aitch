@@ -1054,15 +1054,15 @@ fn personal_max(e: &Env) -> (PathBuf, PathBuf) {
     (own, max)
 }
 
-const CORTEX: &str = "https://c.example/mcp";
-/// Claude Code's key for CORTEX's sign-in: the name and the first 16 hex of sha256 of {"type","url","headers"}.
-const CORTEX_KEY: &str = "cortex|32928f708bfba17d";
+const NOTES: &str = "https://c.example/mcp";
+/// Claude Code's key for NOTES's sign-in: the name and the first 16 hex of sha256 of {"type","url","headers"}.
+const NOTES_KEY: &str = "notes|32928f708bfba17d";
 
 #[test]
 fn link_gives_a_new_folder_the_servers_and_answers_of_its_source() {
     let e = Env::new(ROOM);
     let mut f = json_of(&e.work);
-    f["mcpServers"]["cortex"] = serde_json::json!({"type": "http", "url": CORTEX});
+    f["mcpServers"]["notes"] = serde_json::json!({"type": "http", "url": NOTES});
     f["projects"] = serde_json::json!({ e.acme.to_string_lossy(): {
         "hasTrustDialogAccepted": true, "hasClaudeMdExternalIncludesApproved": true}});
     set_json(&e.work, f.clone());
@@ -1076,7 +1076,7 @@ fn link_gives_a_new_folder_the_servers_and_answers_of_its_source() {
     assert_eq!(p["hasClaudeMdExternalIncludesApproved"], true, "{t}");
     assert!(t.get("oauthAccount").is_none(), "login copied: {t}");
     assert!(
-        text(&out.stdout).contains("+cortex"),
+        text(&out.stdout).contains("+notes"),
         "{}",
         text(&out.stdout)
     );
@@ -1086,7 +1086,7 @@ fn link_gives_a_new_folder_the_servers_and_answers_of_its_source() {
 fn every_launch_brings_its_linked_folder_in_line_with_the_source() {
     let e = Env::new(ROOM);
     let mut f = json_of(&e.work);
-    f["mcpServers"]["cortex"] = serde_json::json!({"type": "http", "url": CORTEX});
+    f["mcpServers"]["notes"] = serde_json::json!({"type": "http", "url": NOTES});
     set_json(&e.work, f.clone());
     let out = e.run(&e.acme, &["launch", "claude"]);
     let (so, se) = (text(&out.stdout), text(&out.stderr));
@@ -1096,7 +1096,7 @@ fn every_launch_brings_its_linked_folder_in_line_with_the_source() {
         json_of(&e.primary)["oauthAccount"]["organizationUuid"],
         "org-primary"
     );
-    assert!(se.contains("synced from") && se.contains("+cortex"), "{se}");
+    assert!(se.contains("synced from") && se.contains("+notes"), "{se}");
     // A backup of the file as it was, under ~/.aitch/backups.
     assert_eq!(
         fs::read_dir(e.home.join(".aitch/backups")).unwrap().count(),
@@ -1118,7 +1118,7 @@ fn every_launch_brings_its_linked_folder_in_line_with_the_source() {
 fn a_launch_says_loudly_when_it_cannot_sync() {
     let e = Env::new(ROOM);
     let mut f = json_of(&e.work);
-    f["mcpServers"]["cortex"] = serde_json::json!({"type": "http", "url": CORTEX});
+    f["mcpServers"]["notes"] = serde_json::json!({"type": "http", "url": NOTES});
     set_json(&e.work, f);
     fs::create_dir(e.primary.join(".claude.json.lock")).unwrap();
     let out = e.run(&e.acme, &["launch", "claude"]);
@@ -1135,7 +1135,7 @@ fn primary_option_without_a_route_starts_a_folder_linked_to_the_profiles_own() {
     let e = Env::new(ROOM);
     let (own, max) = personal_max(&e);
     let mut f = json_of(&own);
-    f["mcpServers"]["cortex"] = serde_json::json!({"type": "http", "url": CORTEX});
+    f["mcpServers"]["notes"] = serde_json::json!({"type": "http", "url": NOTES});
     set_json(&own, f.clone());
     fs::write(e.bin.join("quota"), "#!/bin/sh\ntouch \"$HOME/asked\"\n").unwrap();
     let out = e.run(
@@ -1179,6 +1179,108 @@ fn primary_option_naming_the_profiles_own_default_folder_starts_it_as_the_hook_d
     );
 }
 
+/// A personal profile that names the default folder by its path and routes it to a linked ~/.claude-max. The default
+/// folder's settings are only in ~/.claude.json, as on a machine without the link the other tests make.
+fn routed_default(e: &Env, quota: &str) -> (PathBuf, PathBuf) {
+    let own = e.home.join(".claude");
+    fs::create_dir_all(&own).unwrap();
+    fs::write(own.join("CLAUDE.md"), "mine").unwrap();
+    fs::write(own.join("settings.json"), "{}").unwrap();
+    fs::write(
+        e.home.join(".claude.json"),
+        r#"{"oauthAccount":{"organizationUuid":"org-personal"}}"#,
+    )
+    .unwrap();
+    let max = e.home.join(".claude-max");
+    let out = e.run(
+        &e.home,
+        &["link", &own.to_string_lossy(), &max.to_string_lossy()],
+    );
+    assert!(out.status.success(), "link: {}", text(&out.stderr));
+    login(&max, "org-max");
+    script(&e.bin.join("quota"), quota);
+    let yaml = format!(
+        "default: personal\nprofiles:\n  personal:\n    providers: {{ claude: {} }}\n    directories: [{}]\n    route:\n      claude:\n        primary: {}\n        fallback_org: org-personal\n        quota: {}\n",
+        own.display(),
+        e.home.join("Projects/personal").display(),
+        max.display(),
+        e.bin.join("quota").display()
+    );
+    fs::write(e.home.join(".aitch/config.yaml"), yaml).unwrap();
+    (own, max)
+}
+
+#[test]
+fn a_route_that_falls_back_to_the_default_folder_starts_it_unset_and_writes_its_own_file() {
+    let e = Env::new(ROOM);
+    let (own, max) = routed_default(&e, FULL);
+    let mut m = json_of(&max);
+    m["projects"] =
+        serde_json::json!({ e.personal.to_string_lossy(): {"hasTrustDialogAccepted": true}});
+    set_json(&max, m);
+    // Claude Code locks ~/.claude.json under ~/.claude.json.lock: held, aitch writes nothing.
+    let lock = e.home.join(".claude.json.lock");
+    fs::create_dir(&lock).unwrap();
+    let out = e.run(&e.personal, &["launch", "claude"]);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "{se}");
+    // Set by name, Claude Code would read ~/.claude/.claude.json and another login item.
+    assert!(so.contains("DIR=unset\n"), "{so}");
+    assert!(se.contains("held by another process"), "{se}");
+    fs::remove_dir(&lock).unwrap();
+    let out = e.run(&e.personal, &["launch", "claude"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let t: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(e.home.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(
+        t["projects"][e.personal.to_string_lossy().as_ref()]["hasTrustDialogAccepted"],
+        true,
+        "{t}"
+    );
+    assert!(
+        !own.join(".claude.json").exists(),
+        "stray file in ~/.claude"
+    );
+}
+
+#[test]
+fn a_shell_that_names_the_default_folder_gets_it_unset() {
+    let e = Env::new(ROOM);
+    let (own, _) = personal_max(&e);
+    let out = e
+        .cmd(&e.personal, &["launch", "claude"])
+        .env("CLAUDE_CONFIG_DIR", &own)
+        .locked_output()
+        .unwrap();
+    assert!(
+        text(&out.stdout).contains("DIR=unset\n"),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn primary_option_starts_the_folder_as_named_without_a_trailing_slash() {
+    // Claude Code names the login item after the exact string: "~/.claude-max/" would look for another login.
+    let e = Env::new(ROOM);
+    let (_, max) = personal_max(&e);
+    let out = e.run(
+        &e.personal,
+        &[
+            "launch",
+            "claude",
+            "--primary",
+            &format!("{}/", max.display()),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains(&format!("DIR={}\n", max.display())),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
 #[test]
 fn mcp_subcommand_on_a_linked_folder_runs_on_its_source() {
     let e = Env::new(ROOM);
@@ -1213,7 +1315,8 @@ fn mcp_subcommand_on_a_linked_folder_runs_on_its_source() {
     );
 }
 
-/// A fake `security` (macOS) and `.credentials.json` files (elsewhere) with these blobs per folder.
+/// A fake `security` (macOS) or `.credentials.json` files (elsewhere) with these blobs per folder. On macOS no file is
+/// written: the doctor finds a login only under the keychain item Claude Code names after the folder.
 fn fake_logins(e: &Env, blobs: &[(&Path, Option<&str>, &str)]) {
     use sha2::{Digest, Sha256};
     let mut cases = String::new();
@@ -1226,7 +1329,9 @@ fn fake_logins(e: &Env, blobs: &[(&Path, Option<&str>, &str)]) {
             ),
         };
         cases.push_str(&format!("  '{svc}') printf '%s\\n' '{blob}' ;;\n"));
-        fs::write(dir.join(".credentials.json"), blob).unwrap();
+        if !cfg!(target_os = "macos") {
+            fs::write(dir.join(".credentials.json"), blob).unwrap();
+        }
     }
     script(
         &e.bin.join("security"),
@@ -1239,11 +1344,11 @@ fn doctor_lists_each_folder_with_its_login_servers_and_sign_ins_and_never_a_toke
     let e = Env::new(ROOM);
     let (own, max) = personal_max(&e);
     let mut f = json_of(&own);
-    f["mcpServers"]["cortex"] = serde_json::json!({"type": "http", "url": CORTEX});
+    f["mcpServers"]["notes"] = serde_json::json!({"type": "http", "url": NOTES});
     f["projects"] = serde_json::json!({"/r": {"hasTrustDialogAccepted": true}});
     set_json(&own, f);
     let signed = format!(
-        r#"{{"claudeAiOauth":{{"accessToken":"SECRET-TOKEN-123"}},"mcpOAuth":{{"{CORTEX_KEY}":{{"accessToken":"SECRET-TOKEN-123","refreshToken":"SECRET-R"}}}}}}"#
+        r#"{{"claudeAiOauth":{{"accessToken":"SECRET-TOKEN-123"}},"mcpOAuth":{{"{NOTES_KEY}":{{"accessToken":"SECRET-TOKEN-123","refreshToken":"SECRET-R"}}}}}}"#
     );
     let bare = r#"{"claudeAiOauth":{"accessToken":"SECRET-TOKEN-123"}}"#;
     fake_logins(
@@ -1261,15 +1366,15 @@ fn doctor_lists_each_folder_with_its_login_servers_and_sign_ins_and_never_a_toke
     assert_eq!(out.status.code(), Some(1), "{so}{se}");
     let o = section_of(&so, &own);
     assert!(
-        o.contains("source") && o.contains("signed in") && o.contains("cortex: signed in"),
+        o.contains("source") && o.contains("signed in") && o.contains("notes: signed in"),
         "{o}"
     );
     let m = section_of(&so, &max);
     assert!(m.contains(&format!("linked to {}", own.display())), "{m}");
     assert!(m.contains("login: signed in"), "{m}");
-    assert!(m.contains("NOT IN SYNC") && m.contains("+cortex"), "{m}");
+    assert!(m.contains("NOT IN SYNC") && m.contains("+notes"), "{m}");
     assert!(m.contains("1 answer"), "{m}");
-    assert!(m.contains("cortex: NEEDS SIGN-IN"), "{m}");
+    assert!(m.contains("notes: NEEDS SIGN-IN"), "{m}");
     let p = section_of(&so, &e.primary);
     assert!(p.contains(&format!("linked to {}", e.work_s())), "{p}");
     // After a launch the folder is in sync; the sign-in is still missing, so still a problem.
@@ -1285,7 +1390,7 @@ fn doctor_lists_each_folder_with_its_login_servers_and_sign_ins_and_never_a_toke
         m.contains("MCP servers: in sync") && m.contains("answers: in sync"),
         "{m}"
     );
-    assert!(m.contains("cortex: NEEDS SIGN-IN"), "{m}");
+    assert!(m.contains("notes: NEEDS SIGN-IN"), "{m}");
     assert_eq!(out.status.code(), Some(1));
 }
 
@@ -1308,5 +1413,31 @@ fn doctor_says_when_a_folder_has_no_login() {
     let so = text(&out.stdout);
     let m = section_of(&so, &max);
     assert!(m.contains("login: NOT SIGNED IN"), "{m}");
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn doctor_counts_a_settings_file_it_cannot_read_and_checks_local_servers_too() {
+    let e = Env::new(ROOM);
+    let (own, max) = personal_max(&e);
+    let mut f = json_of(&own);
+    f["projects"] =
+        serde_json::json!({"/r": {"mcpServers": {"notes": {"type": "http", "url": NOTES}}}});
+    set_json(&own, f);
+    let bare = r#"{"claudeAiOauth":{"accessToken":"SECRET-TOKEN-123"}}"#;
+    fake_logins(
+        &e,
+        &[
+            (&own, None, bare),
+            (&max, Some(&max.to_string_lossy()), bare),
+        ],
+    );
+    fs::write(max.join(".claude.json"), "{not json").unwrap();
+    let out = e.run(&e.home, &["doctor"]);
+    let so = text(&out.stdout);
+    let o = section_of(&so, &own);
+    assert!(o.contains("notes (/r): NEEDS SIGN-IN"), "{o}");
+    let m = section_of(&so, &max);
+    assert!(m.contains("CANNOT READ"), "{m}");
     assert_eq!(out.status.code(), Some(1));
 }

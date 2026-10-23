@@ -24,13 +24,11 @@ pub fn oauth_key(name: &str, server: &Json) -> String {
     format!("{name}|{}", &hash[..16])
 }
 
-/// Whether Claude Code signs in to this server with OAuth: a remote (http, sse) one with no Authorization header of
-/// its own and no headers helper.
+/// Whether Claude Code signs in to this server with OAuth: a remote (http, sse) one with no headers of its own (an
+/// Authorization or API key header) and no headers helper.
 pub fn needs_oauth(server: &Json) -> bool {
     let remote = matches!(server["type"].as_str(), Some("http" | "sse"));
-    let own_auth = server["headers"]
-        .as_object()
-        .is_some_and(|h| h.keys().any(|k| k.eq_ignore_ascii_case("authorization")));
+    let own_auth = server["headers"].as_object().is_some_and(|h| !h.is_empty());
     remote && !own_auth && server.get("headersHelper").is_none()
 }
 
@@ -84,28 +82,26 @@ fn has(v: &Json, field: &str) -> bool {
     v[field].as_str().is_some_and(|s| !s.is_empty())
 }
 
-/// The folders to check, each with whether it runs with CLAUDE_CONFIG_DIR unset: every profile's claude folder and
-/// route primary, then every `~/.claude*` folder linked to one of them (or with broken links).
-fn folders(cfg: &Config, home: &Path) -> Vec<(PathBuf, bool)> {
-    let mut out: Vec<(PathBuf, bool)> = vec![];
-    let add = |out: &mut Vec<(PathBuf, bool)>, dir: PathBuf, unset: bool| {
-        if !out
-            .iter()
-            .any(|(d, _)| route::same_dir(d, &dir) || *d == dir)
-        {
-            out.push((dir, unset));
+/// The folders to check: every profile's claude folder and route primary, then every `~/.claude*` folder linked to
+/// one of them (or with broken links). aitch starts the default folder only unset (route::set_config_dir), so one
+/// path is one login item.
+fn folders(cfg: &Config, home: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = vec![];
+    let add = |out: &mut Vec<PathBuf>, dir: PathBuf| {
+        if !out.iter().any(|d| route::same_dir(d, &dir) || *d == dir) {
+            out.push(dir);
         }
     };
     for p in cfg.profiles.values() {
         if let Some(v) = p.providers.get("claude") {
             if v.trim().is_empty() {
-                add(&mut out, route::default_dir(), true);
+                add(&mut out, route::default_dir());
             } else {
-                add(&mut out, PathBuf::from(expand_tilde(v)), false);
+                add(&mut out, PathBuf::from(expand_tilde(v)));
             }
         }
         if let Some(r) = p.route.as_ref().and_then(|r| r.claude.as_ref()) {
-            add(&mut out, PathBuf::from(expand_tilde(&r.primary)), false);
+            add(&mut out, PathBuf::from(expand_tilde(&r.primary)));
         }
     }
     let mut found: Vec<PathBuf> = fs::read_dir(home)
@@ -118,10 +114,10 @@ fn folders(cfg: &Config, home: &Path) -> Vec<(PathBuf, bool)> {
         if !real_dir || !name.is_some_and(|n| n.starts_with(".claude")) {
             continue;
         }
-        let known = |s: &Path| out.iter().any(|(k, _)| route::same_dir(k, s));
+        let known = |s: &Path| out.iter().any(|k| route::same_dir(k, s));
         match route::source_of(&d) {
-            Ok(Some(s)) if known(&s) => add(&mut out, d, false),
-            Err(_) => add(&mut out, d, false),
+            Ok(Some(s)) if known(&s) => add(&mut out, d),
+            Err(_) => add(&mut out, d),
             _ => {}
         }
     }
@@ -136,7 +132,7 @@ pub fn run(cfg: &Config) -> usize {
         problems += 1;
         line.red().bold().to_string()
     };
-    for (dir, unset) in folders(cfg, &home) {
+    for dir in folders(cfg, &home) {
         let source = route::source_of(&dir);
         let role = match &source {
             Ok(None) => "source".to_string(),
@@ -144,11 +140,12 @@ pub fn run(cfg: &Config) -> usize {
             Err(e) => bad(format!("LINKS BROKEN: {e}")),
         };
         println!("{} ({role})", dir.display());
-        let own: Json = fs::read_to_string(route::config_file(&dir))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or(Json::Null);
-        let login = credentials(&dir, unset);
+        let own_read = read_json(&route::config_file(&dir));
+        if let Err(e) = &own_read {
+            println!("  settings: {}", bad(format!("CANNOT READ: {e}")));
+        }
+        let own = own_read.clone().unwrap_or(Json::Null);
+        let login = credentials(&dir, route::is_default_dir(&dir));
         let line = match &login {
             Ok(Some(c))
                 if has(&c["claudeAiOauth"], "accessToken")
@@ -167,7 +164,7 @@ pub fn run(cfg: &Config) -> usize {
         };
         println!("  login: {line}");
         // A linked folder should carry its source's servers: check the sign-ins against those.
-        let mut servers = own["mcpServers"].clone();
+        let mut servers = own_read;
         if let Ok(Some(src)) = &source {
             let line = match route::sync_preview(src, &dir) {
                 Ok(s) if s.servers.is_empty() => {
@@ -193,29 +190,42 @@ pub fn run(cfg: &Config) -> usize {
                 Err(e) => bad(format!("CANNOT COMPARE: {e}")),
             };
             println!("  answers: {line}");
-            servers = fs::read_to_string(route::config_file(src))
-                .ok()
-                .and_then(|t| serde_json::from_str::<Json>(&t).ok())
-                .map(|j| j["mcpServers"].clone())
-                .unwrap_or(Json::Null);
+            servers = read_json(&route::config_file(src));
         }
+        let servers = match servers {
+            Ok(j) => j,
+            Err(e) => {
+                println!("  MCP sign-in: {}", bad(format!("CANNOT CHECK: {e}")));
+                continue;
+            }
+        };
         let oauth = login
             .as_ref()
             .ok()
             .and_then(|c| c.as_ref())
             .map(|c| c["mcpOAuth"].clone())
             .unwrap_or(Json::Null);
+        // User-scope servers, then each project's local ones (named with their project).
+        let mut all: Vec<(String, &str, &Json)> = vec![];
+        for (name, s) in servers["mcpServers"].as_object().into_iter().flatten() {
+            all.push((name.clone(), name, s));
+        }
+        for (k, p) in servers["projects"].as_object().into_iter().flatten() {
+            for (name, s) in p["mcpServers"].as_object().into_iter().flatten() {
+                all.push((format!("{name} ({k})"), name, s));
+            }
+        }
         let mut signs = vec![];
-        for (name, s) in servers.as_object().into_iter().flatten() {
+        for (label, name, s) in all {
             if !needs_oauth(s) {
                 continue;
             }
             let entry = &oauth[oauth_key(name, s).as_str()];
             if has(entry, "accessToken") || has(entry, "refreshToken") {
-                signs.push(format!("{name}: signed in"));
+                signs.push(format!("{label}: signed in"));
             } else {
                 signs.push(bad(format!(
-                    "{name}: NEEDS SIGN-IN (in a session on this folder: /mcp)"
+                    "{label}: NEEDS SIGN-IN (in a session on this folder: /mcp)"
                 )));
             }
         }
@@ -228,6 +238,13 @@ pub fn run(cfg: &Config) -> usize {
     problems
 }
 
+/// A settings file, parsed; the error names the file and the place, never its content.
+fn read_json(path: &Path) -> Result<Json, String> {
+    let text =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    serde_json::from_str(&text).map_err(|e| format!("{} is not JSON ({e})", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,10 +253,10 @@ mod tests {
     fn oauth_key_is_the_one_claude_code_files_the_sign_in_under() {
         // The rule was checked against real login items of Claude Code 2.1.309; key order is type, url, headers.
         let s = serde_json::json!({"type": "http", "url": "https://c.example/mcp"});
-        assert_eq!(oauth_key("cortex", &s), "cortex|32928f708bfba17d");
+        assert_eq!(oauth_key("notes", &s), "notes|32928f708bfba17d");
         let with =
             serde_json::json!({"url": "https://c.example/mcp", "type": "http", "headers": {}});
-        assert_eq!(oauth_key("cortex", &with), "cortex|32928f708bfba17d");
+        assert_eq!(oauth_key("notes", &with), "notes|32928f708bfba17d");
     }
 
     #[test]
@@ -257,6 +274,10 @@ mod tests {
         ));
         assert!(!needs_oauth(
             &serde_json::json!({"type": "http", "url": "u", "headersHelper": "h"})
+        ));
+        // A key in a header of another name is its own sign-in too.
+        assert!(!needs_oauth(
+            &serde_json::json!({"type": "http", "url": "u", "headers": {"X-API-Key": "k"}})
         ));
     }
 

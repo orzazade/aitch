@@ -126,11 +126,14 @@ fn env_exports(profile: &crate::config::Profile) -> String {
     for (key, value) in &profile.providers {
         if let Some(env_var) = providers::get_env_var(key) {
             // An empty value means "use the tool's default folder": remove any inherited value.
-            if value.trim().is_empty() {
+            // So is Claude Code's default folder named by its path (see route::is_default_dir).
+            let expanded = providers::env_value(key, &expand_tilde(value));
+            if value.trim().is_empty()
+                || (key == "claude" && crate::route::is_default_dir(Path::new(&expanded)))
+            {
                 out.push_str(&format!("          unset {}\n", env_var));
                 continue;
             }
-            let expanded = providers::env_value(key, &expand_tilde(value));
             out.push_str(&format!(
                 "          export {}='{}'\n",
                 env_var,
@@ -321,6 +324,21 @@ mod tests {
             run_cache(&cache, &root.path().join("acme-ideas")),
             "/tmp/claude-personal"
         );
+    }
+
+    #[test]
+    fn the_default_claude_folder_named_by_path_unsets_the_variable() {
+        // Claude Code reads ~/.claude.json and its login item only with CLAUDE_CONFIG_DIR unset.
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join("elsewhere")).unwrap();
+        for v in ["~/.claude", "~/.claude/"] {
+            let cache = generate_cache(&boundary_config(root.path(), v));
+            assert_eq!(
+                run_cache(&cache, &root.path().join("elsewhere")),
+                "UNSET",
+                "{v}"
+            );
+        }
     }
 
     #[test]

@@ -378,7 +378,14 @@ fn start_claude(primary: Option<&str>, args: &[String]) -> Result<(), Box<dyn st
     });
     // The caller picked the account, so no org check; but the folder is its full path and has a login, or Claude
     // Code would read it from wherever it starts and ask to sign in there.
-    let primary = primary.map(resolve::expand_tilde);
+    // Claude Code names the login item after the exact string, so "~/.claude-max/" would look for another login.
+    let primary = primary.map(|p| {
+        let p = resolve::expand_tilde(p);
+        match p.trim_end_matches('/') {
+            "" => p,
+            t => t.to_string(),
+        }
+    });
     if let Some(p) = &primary {
         if !Path::new(p).is_absolute() {
             return Err(format!("--primary needs an absolute folder, not {:?}", p).into());
@@ -477,7 +484,7 @@ fn start_claude(primary: Option<&str>, args: &[String]) -> Result<(), Box<dyn st
             ),
         }
         sync_linked(&choice.dir);
-        cmd.env("CLAUDE_CONFIG_DIR", &choice.dir);
+        route::set_config_dir(&mut cmd, &choice.dir);
         if choice.primary {
             // One word: --mcp-config takes values up to the next flag and would eat the user's first arguments.
             cmd.arg(format!("--mcp-config={}", mcp.display()));
@@ -492,8 +499,7 @@ fn start_claude(primary: Option<&str>, args: &[String]) -> Result<(), Box<dyn st
             .as_ref()
             .and_then(|p| p.providers.get("claude"))
             .ok_or("--primary needs a profile with a claude folder for this directory")?;
-        let unset = value.trim().is_empty();
-        let own = if unset {
+        let own = if value.trim().is_empty() {
             route::default_dir()
         } else {
             PathBuf::from(resolve::expand_tilde(value))
@@ -516,24 +522,24 @@ fn start_claude(primary: Option<&str>, args: &[String]) -> Result<(), Box<dyn st
             }
         }
         let dir = if args.first().is_some_and(|a| a == "mcp") {
-            eprintln!(
-                "aitch: claude mcp runs on {}, whose servers {} takes",
-                own.display(),
-                p.display()
-            );
-            own.clone()
+            // The servers are kept in the folder `p` takes them from (its source), or in `p` itself.
+            let src = route::source_of(p)
+                .map_err(|e| format!("not launching claude: {}", e))?
+                .unwrap_or_else(|| p.to_path_buf());
+            if !route::same_dir(&src, p) {
+                eprintln!(
+                    "aitch: claude mcp runs on {}, whose servers {} takes",
+                    src.display(),
+                    p.display()
+                );
+            }
+            src
         } else {
             sync_linked(p);
             p.to_path_buf()
         };
         eprintln!("aitch: {} → {} (named by --primary)", name, dir.display());
-        // As the hook starts it: Claude Code names a folder's login item after CLAUDE_CONFIG_DIR, so the default
-        // folder set by name would look for another login.
-        if unset && route::same_dir(&dir, &own) {
-            cmd.env_remove("CLAUDE_CONFIG_DIR");
-        } else {
-            cmd.env("CLAUDE_CONFIG_DIR", &dir);
-        }
+        route::set_config_dir(&mut cmd, &dir);
     } else if let Some(d) = env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .filter(|d| d.is_absolute())
@@ -547,13 +553,12 @@ fn start_claude(primary: Option<&str>, args: &[String]) -> Result<(), Box<dyn st
                     src.display(),
                     d.display()
                 );
-                if route::same_dir(&src, &route::default_dir()) {
-                    cmd.env_remove("CLAUDE_CONFIG_DIR");
-                } else {
-                    cmd.env("CLAUDE_CONFIG_DIR", &src);
-                }
+                route::set_config_dir(&mut cmd, &src);
             }
-            _ => sync_linked(&d),
+            _ => {
+                sync_linked(&d);
+                route::set_config_dir(&mut cmd, &d);
+            }
         }
     }
     let err = cmd.args(args).exec();

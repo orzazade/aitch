@@ -12,6 +12,13 @@
   need a sign-in there. It exits 1 on a problem and prints no token.
 - `--primary` works for a profile without a route: the folder must be the profile's own or linked to it.
 
+### Changed
+
+- The default folder `~/.claude` named by its path (`claude: ~/.claude`, a route falling back to it, a shell that
+  sets it) now starts with `CLAUDE_CONFIG_DIR` unset, so Claude Code uses `~/.claude.json` and its default login, as
+  aitch reads them. A profile that named it by path used another login item before; sign in again if asked.
+- `aitch link` refuses a source that is itself linked to another folder.
+
 ### Fixed
 
 - `--primary` naming the default folder `~/.claude` starts it with `CLAUDE_CONFIG_DIR` unset, as the hook does, so

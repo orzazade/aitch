@@ -252,7 +252,15 @@ the source folder sets for all of them, when you run `aitch link` and on every l
 Nothing else changes; the login fields are never touched. A missing `.claude.json` is created with mode 0600. Before
 each write the old file is saved in `~/.aitch/backups/` (mode 0600, the last 10 per folder). Each launch that
 changes something prints a line such as `aitch: ~/.claude-alt synced from ~/.claude-work: MCP servers +db`. `claude
-mcp …` on a linked folder runs on the source, where the servers are kept.
+mcp …` on a linked folder runs on the source, where the servers are kept. Link new folders to the source itself:
+aitch refuses a folder linked to a folder that is itself linked. The copies and backups hold whole server entries,
+so a token written into a server's `headers` or `env` is copied with them; keep such keys in a `headersHelper` or
+the environment instead.
+
+Claude Code picks the settings file and the login by `CLAUDE_CONFIG_DIR`, not by the folder: set to `~/.claude`, it
+reads `~/.claude/.claude.json` and another keychain item than with the variable unset. So aitch starts the default
+folder `~/.claude` (or a link to it) only with the variable unset, on every launch and in the hook, even when the
+config names it by its path. Its settings are then always `~/.claude.json`.
 
 MCP sign-ins (OAuth) are not copied: Claude Code keeps them in the folder's keychain item, next to its login. Sign
 in once per folder with `/mcp`. `aitch doctor` lists, per folder, the login, whether its servers and answers match
