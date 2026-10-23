@@ -49,30 +49,9 @@ fn keychain_service(dir: &Path, unset: bool) -> String {
 /// The login Claude Code keeps for `dir`, parsed, in memory only: the macOS keychain item, else the folder's
 /// `.credentials.json`. None: no login stored. `unset`: the folder runs with CLAUDE_CONFIG_DIR unset.
 fn credentials(dir: &Path, unset: bool) -> Result<Option<Json>, String> {
-    let parse = |text: &str, what: &str| {
-        serde_json::from_str::<Json>(text.trim())
-            .map(Some)
-            .map_err(|e| format!("{what} is not JSON ({e})"))
-    };
-    if cfg!(target_os = "macos") {
-        let svc = keychain_service(dir, unset);
-        let out = Command::new("security")
-            .args(["find-generic-password", "-s", &svc, "-w"])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("cannot run security: {e}"))?;
-        match out.status.code() {
-            Some(0) => return parse(&String::from_utf8_lossy(&out.stdout), &svc),
-            // 44: no such item; Claude Code then keeps the login in the file.
-            Some(44) => {}
-            _ => {
-                let err = String::from_utf8_lossy(&out.stderr);
-                return Err(format!(
-                    "security: {}",
-                    err.lines().next().unwrap_or("failed")
-                ));
-            }
-        }
+    // No keychain item: Claude Code then keeps the login in the file.
+    if let Some(c) = keychain(dir, unset)? {
+        return Ok(Some(c));
     }
     let file = dir.join(".credentials.json");
     match fs::read_to_string(&file) {
@@ -80,6 +59,37 @@ fn credentials(dir: &Path, unset: bool) -> Result<Option<Json>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("cannot read {}: {e}", file.display())),
     }
+}
+
+/// The folder's macOS keychain item, parsed, in memory only; None when there is none (or not on macOS).
+fn keychain(dir: &Path, unset: bool) -> Result<Option<Json>, String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(None);
+    }
+    let svc = keychain_service(dir, unset);
+    let out = Command::new("security")
+        .args(["find-generic-password", "-s", &svc, "-w"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run security: {e}"))?;
+    match out.status.code() {
+        Some(0) => parse(&String::from_utf8_lossy(&out.stdout), &svc),
+        // 44: no such item.
+        Some(44) => Ok(None),
+        _ => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            Err(format!(
+                "security: {}",
+                err.lines().next().unwrap_or("failed")
+            ))
+        }
+    }
+}
+
+fn parse(text: &str, what: &str) -> Result<Option<Json>, String> {
+    serde_json::from_str::<Json>(text.trim())
+        .map(Some)
+        .map_err(|e| format!("{what} is not JSON ({e})"))
 }
 
 /// A token field that holds something.
@@ -93,7 +103,7 @@ fn has(v: &Json, field: &str) -> bool {
 fn folders(cfg: &Config, home: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = vec![];
     let add = |out: &mut Vec<PathBuf>, dir: PathBuf| {
-        if !out.iter().any(|d| route::same_dir(d, &dir) || *d == dir) {
+        if !out.iter().any(|d| route::same_config(d, &dir)) {
             out.push(dir);
         }
     };
@@ -170,7 +180,7 @@ pub fn run(cfg: &Config) -> usize {
         println!("  login: {line}");
         // A login stored while something set CLAUDE_CONFIG_DIR to this path: a keychain item of its own (macOS).
         if cfg!(target_os = "macos") && route::is_default_dir(&dir) {
-            if let Ok(Some(c)) = credentials(&dir, false) {
+            if let Ok(Some(c)) = keychain(&dir, false) {
                 if has(&c["claudeAiOauth"], "accessToken")
                     || has(&c["claudeAiOauth"], "refreshToken")
                 {

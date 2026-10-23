@@ -522,15 +522,11 @@ fn start_claude(primary: Option<&str>, args: &[String]) -> Result<(), Box<dyn st
             }
         }
         let dir = if args.first().is_some_and(|a| a == "mcp") {
-            // The servers are kept in the profile's folder, named as the profile names it (Claude Code names the login
-            // item after that string); in its own source if the profile's folder is itself linked.
-            let src = if route::same_dir(p, &own) {
-                route::source_of(&own)
-                    .map_err(|e| format!("not launching claude: {}", e))?
-                    .unwrap_or_else(|| own.clone())
-            } else {
-                own.clone()
-            };
+            // The servers are kept in the folder `p` links to, named as its links name it (Claude Code names the
+            // login item after that string), or in `p` itself.
+            let src = route::source_of(p)
+                .map_err(|e| format!("not launching claude: {}", e))?
+                .unwrap_or_else(|| p.to_path_buf());
             if !route::same_dir(&src, p) {
                 eprintln!(
                     "aitch: claude mcp runs on {}, whose servers {} takes",

@@ -1309,6 +1309,87 @@ fn a_shell_that_names_a_link_to_the_default_folder_keeps_it() {
     );
 }
 
+/// ~/.claude with its own `.claude.json` (servers `a`), a different real ~/.claude.json (servers `b`), and the link
+/// ~/.claude-personal -> ~/.claude. Started as ~/.claude-personal, Claude Code reads ~/.claude/.claude.json.
+fn default_and_alias(e: &Env) -> (PathBuf, PathBuf) {
+    let own = e.home.join(".claude");
+    fs::create_dir_all(&own).unwrap();
+    fs::write(own.join("CLAUDE.md"), "mine").unwrap();
+    fs::write(own.join("settings.json"), "{}").unwrap();
+    fs::write(
+        own.join(".claude.json"),
+        r#"{"oauthAccount":{"organizationUuid":"org-alias"},"mcpServers":{"a":{"command":"a"}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        e.home.join(".claude.json"),
+        r#"{"oauthAccount":{"organizationUuid":"org-personal"},"mcpServers":{"b":{"command":"b"}}}"#,
+    )
+    .unwrap();
+    let alias = e.home.join(".claude-personal");
+    std::os::unix::fs::symlink(&own, &alias).unwrap();
+    (own, alias)
+}
+
+#[test]
+fn a_folder_linked_from_a_link_to_the_default_folder_takes_that_links_settings() {
+    let e = Env::new(ROOM);
+    let (_, alias) = default_and_alias(&e);
+    let fresh = e.home.join(".claude-new");
+    let out = e.run(
+        &e.home,
+        &["link", &alias.to_string_lossy(), &fresh.to_string_lossy()],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        json_of(&fresh)["mcpServers"],
+        serde_json::json!({"a": {"command": "a"}}),
+        "{}",
+        text(&out.stdout)
+    );
+    // A launch syncs from the folder its links name: still `a`, not ~/.claude.json's `b`.
+    let out = e
+        .cmd(&e.personal, &["launch", "claude"])
+        .env("CLAUDE_CONFIG_DIR", &fresh)
+        .locked_output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        json_of(&fresh)["mcpServers"],
+        serde_json::json!({"a": {"command": "a"}}),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = e
+        .cmd(&e.personal, &["launch", "claude", "--", "mcp", "list"])
+        .env("CLAUDE_CONFIG_DIR", &fresh)
+        .locked_output()
+        .unwrap();
+    assert!(
+        text(&out.stdout).contains(&format!("DIR={}\n", alias.display())),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn doctor_checks_the_default_folder_and_a_link_to_it_as_two_folders() {
+    // Two names, two login items: each is checked.
+    let e = Env::new(ROOM);
+    let (own, alias) = default_and_alias(&e);
+    let yaml = format!(
+        "default: personal\nprofiles:\n  personal:\n    providers: {{ claude: '' }}\n    directories: [{}]\n  alt:\n    providers: {{ claude: {} }}\n    directories: [{}]\n",
+        e.home.join("Projects/personal").display(),
+        alias.display(),
+        e.home.join("Projects/acme").display(),
+    );
+    fs::write(e.home.join(".aitch/config.yaml"), yaml).unwrap();
+    let out = e.run(&e.home, &["doctor"]);
+    let so = text(&out.stdout);
+    section_of(&so, &own);
+    section_of(&so, &alias);
+}
+
 #[test]
 fn a_source_whose_rules_link_into_the_home_folder_is_still_a_source() {
     let e = Env::new(ROOM);

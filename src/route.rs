@@ -469,15 +469,17 @@ fn edit_claude_json<R>(
     backups: &Path,
     edit: &dyn Fn(&mut Object) -> Result<Option<R>, String>,
 ) -> Result<Option<R>, String> {
-    let path = write_target(dir)?;
     // A look without the lock first: most launches change nothing and need not wait for it.
-    if edit(&mut read_current(&path)?.0)?.is_none() {
+    if edit(&mut read_current(&write_target(dir)?)?.0)?.is_none() {
         return Ok(None);
     }
     // Claude Code locks the name it opens, not the file a link leads to.
     let lock = take_lock(&config_file(dir))?;
+    let path = config_file(dir);
     let result = (|| {
         for _ in 0..3 {
+            // Where a link leads is read under the lock, each try: it may have been pointed elsewhere meanwhile.
+            let path = write_target(dir)?;
             let (mut json, before) = read_current(&path)?;
             let Some(r) = edit(&mut json)? else {
                 return Ok(None);
@@ -676,6 +678,28 @@ pub fn source_of(dir: &Path) -> Result<Option<PathBuf>, String> {
     Ok(Some(src))
 }
 
+/// `p` with `.` and `..` folded away by name, no link followed.
+fn lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Whether `a` and `b` are one folder to Claude Code: both the default folder, or the same name (a trailing '/'
+/// aside). A link of another name is another folder, with its own settings and login item.
+pub fn same_config(a: &Path, b: &Path) -> bool {
+    let name = |p: &Path| PathBuf::from(p.to_string_lossy().trim_end_matches('/'));
+    (is_default_dir(a) && is_default_dir(b)) || name(a) == name(b)
+}
+
 /// The one config folder `dir`'s LINKS point into, if any.
 fn links_into(dir: &Path) -> Result<Option<PathBuf>, String> {
     let mut found: Option<PathBuf> = None;
@@ -684,16 +708,14 @@ fn links_into(dir: &Path) -> Result<Option<PathBuf>, String> {
         let Ok(target) = fs::read_link(&at) else {
             continue;
         };
-        let Some(folder) = dir
-            .join(target)
-            .parent()
-            .and_then(|p| fs::canonicalize(p).ok())
-        else {
+        // The folder as the link names it, not resolved: Claude Code tells folders apart by name, so a link to
+        // ~/.claude-personal is that folder (its own settings and login), not ~/.claude.
+        let Some(folder) = lexical(&dir.join(target)).parent().map(Path::to_path_buf) else {
             continue;
         };
         // The home folder holds ~/.claude.json, but a rule linked from there (dotfiles) is no config folder.
-        let home = dirs::home_dir().and_then(|h| fs::canonicalize(h).ok());
-        if !config_file(&folder).exists() || home.as_ref() == Some(&folder) {
+        let home = dirs::home_dir().unwrap_or_default();
+        if !config_file(&folder).exists() || same_dir(&home, &folder) {
             continue;
         }
         match &found {
@@ -1675,8 +1697,9 @@ mod tests {
     #[test]
     fn source_of_a_linked_folder_is_the_folder_it_links_to() {
         let s = setup();
-        let fallback = fs::canonicalize(&s.fallback).unwrap();
-        assert_eq!(source_of(&s.primary).unwrap(), Some(fallback));
+        // Named as the links name it (here /var/…, not the /private/var/… it resolves to): Claude Code tells
+        // folders apart by name.
+        assert_eq!(source_of(&s.primary).unwrap(), Some(s.fallback.clone()));
         assert_eq!(
             source_of(&s.fallback).unwrap(),
             None,
